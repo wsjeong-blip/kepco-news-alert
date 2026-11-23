@@ -4,7 +4,7 @@
 
 환경변수
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (필수)
-  NAVER_CLIENT_ID, NAVER_CLIENT_SECRET  (권장: 네이버 뉴스 API)
+  NAVER_CLIENT_ID, NAVER_CLIENT_SECRET  (선택: NAVER API HUB 키. 없으면 네이버는 건너뜀)
 """
 import html
 import json
@@ -148,10 +148,11 @@ def fetch_naver():
         return []
     items = []
     for kw in ("한국전력", "한전", "KEPCO", *TOPIC_KEYWORDS):
-        url = ("https://openapi.naver.com/v1/search/news.json?display=100&sort=date&query="
-               + urllib.parse.quote(kw))
-        data = json.loads(http_get(url, {"X-Naver-Client-Id": cid,
-                                         "X-Naver-Client-Secret": secret}))
+        # NAVER API HUB (2026.7.31부터 신규 키는 여기서만 발급)
+        url = ("https://naverapihub.apigw.ntruss.com/search/v1/news"
+               "?display=100&sort=date&format=json&query=" + urllib.parse.quote(kw))
+        data = json.loads(http_get(url, {"X-NCP-APIGW-API-KEY-ID": cid,
+                                         "X-NCP-APIGW-API-KEY": secret}))
         for it in data.get("items", []):
             orig = it.get("originallink") or ""
             dom = outlet_of(orig)
