@@ -123,15 +123,20 @@ def parse_date(s):
 
 def http_get(url, headers=None):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", **(headers or {})})
-    with urllib.request.urlopen(req, timeout=20) as r:
+    with urllib.request.urlopen(req, timeout=15) as r:
         return r.read()
 
 
 SOURCE_LOG = []  # 요청 단위 로그: (출처, 결과, 받은 기사 수, 비고)
 
 
+def progress(msg):
+    print(f"[{datetime.now(KST).strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
 def log_source(name, ok, n=0, note=""):
     SOURCE_LOG.append((name, "성공" if ok else "실패", n, note))
+    progress(f"{name}: {'성공' if ok else '실패'} {n}건 {note}")
 
 
 def item(id_, title, link, dom, date, via):
@@ -221,23 +226,16 @@ def send_text(text):
     body = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML",
                                    "disable_web_page_preview": "false"}).encode()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    for attempt in range(2):  # 429(잠시 제한)·시간초과는 한 번 기다렸다 재시도
+    for attempt in range(2):
         try:
-            urllib.request.urlopen(url, body, timeout=30)
+            urllib.request.urlopen(url, body, timeout=15)
             return
         except urllib.error.HTTPError as e:  # 텔레그램이 알려주는 실제 사유까지 남김
-            detail = e.read().decode("utf-8", "replace")[:200]
-            if e.code == 429 and attempt == 0:
-                try:
-                    wait = int(json.loads(detail)["parameters"]["retry_after"])
-                except Exception:
-                    wait = 30
-                if wait <= 60:
-                    time.sleep(wait + 1)
-                    continue
-            raise Exception(f"HTTP {e.code}: {detail}")
+            # 429(요청 제한)는 기다려도 소용없는 경우가 많아 바로 실패 처리
+            raise Exception(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}")
         except (TimeoutError, urllib.error.URLError) as e:
             if attempt == 0:
+                progress("텔레그램 응답 없음 → 3초 뒤 1회 재시도")
                 time.sleep(3)
                 continue
             raise Exception(f"연결 실패: {e}")
@@ -297,8 +295,10 @@ def write_report(items, matched, new, sent, first_run, tg_errors, test_result=No
 
 
 def main():
+    progress("시작")
     test_result = None
     if os.getenv("TEST_MESSAGE", "").lower() == "true":
+        progress("테스트 메시지 전송 중")
         try:
             send_test_message()
             test_result = "성공 (텔레그램 방을 확인하세요)"
@@ -334,6 +334,7 @@ def main():
     for it in sorted(new, key=lambda x: x["date"] or now):
         if not first_run:  # 첫 실행은 기록만 (알림 폭탄 방지)
             try:
+                progress(f"전송: {it['title'][:40]}")
                 send_telegram(it)
                 it["sent"] = True
                 sent += 1
@@ -348,6 +349,7 @@ def main():
         seen += list(it["keys"])
 
     json.dump(seen[-MAX_SEEN:], open(SEEN_FILE, "w", encoding="utf-8"), ensure_ascii=False)
+    progress(f"완료 (신규 {len(new)} / 전송 {sent})")
     write_report(items, matched, new, sent, first_run, tg_errors, test_result)
 
 
