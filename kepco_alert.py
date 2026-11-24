@@ -1,15 +1,11 @@
-"""KEPCO 뉴스 + 공개 유출·랜섬웨어 위협정보 모니터링 → 텔레그램.
+"""한국전력/한전 뉴스 알림 → 텔레그램
+- 대상: 지정 언론사(방송·통신·주요 일간지) + 보안 전문지
+- 한전 계열사 기사 제외
 
-- 기존 지정 언론사 뉴스, ransomware.live RSS 유지
-- RansomLook / ThreatCluster 공개 랜섬웨어 피해 주장 RSS 추가
-- 공개 보도 내 해킹포럼·정보판매 관련 KEPCO 키워드 탐지 (포럼 직접 수집 아님)
-- 선택: HIBP 인증 도메인 유출 계정 집계(API 키와 도메인 인증 필요)
-- 유출 원본·계정 주소·비밀번호는 다운로드하거나 저장/발송하지 않음
-
-필수 환경변수: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-선택 환경변수: NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, HIBP_API_KEY, HIBP_DOMAIN
+환경변수
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (필수)
+  NAVER_CLIENT_ID, NAVER_CLIENT_SECRET  (선택: NAVER API HUB 키. 없으면 네이버는 건너뜀)
 """
-import hashlib
 import html
 import json
 import os
@@ -25,10 +21,8 @@ from email.utils import parsedate_to_datetime
 
 KST = timezone(timedelta(hours=9))
 SEEN_FILE = "seen.json"
-MAX_SEEN = 20000  # 기사 ID와 제목의 복수 키를 보관하므로 충분한 이력 유지
-MAX_AGE = timedelta(hours=6)  # 뉴스 기사만 적용
-INTEL_MAX_AGE = timedelta(days=14)  # 공개 유출정보는 수집 지연을 고려
-
+MAX_SEEN = 3000
+MAX_AGE = timedelta(hours=6)
 
 # ── 감시 대상 언론사 (도메인: (표시명, 분류)) ── 필요하면 여기만 고치면 됨
 OUTLETS = {
@@ -59,12 +53,20 @@ OUTLETS = {
     "dailysecu.com": ("데일리시큐", "보안"),
     "datanet.co.kr": ("데이터넷", "보안"),
     # 다크웹 (랜섬웨어 조직 유출 사이트 모음)
-    "ransomware.live": ("랜섬웨어 유출", "유출정보"),
-    "ransomlook.io": ("RansomLook", "유출정보"),
-    "threatcluster.io": ("ThreatCluster", "유출정보"),
-    "public-intel.google": ("공개 유출·포럼 보도", "공개위협보도"),
-    "hibp": ("HIBP 도메인 계정", "유출계정"),
+    "ransomware.live": ("랜섬웨어 유출", "다크웹"),
+    # 감시 목록 밖 언론사 (한전 + 유출·해킹 기사만)
+    "_other": ("기타 언론", "유출보도"),
 }
+
+# 언론사 제한 없이 찾는 '한전 유출·해킹' 기사 (제목에 회사 + 사고 단어가 모두 있어야 알림)
+BREACH_QUERIES = ["한전 유출", "한국전력 유출", "한전 해킹", "한국전력 해킹", "KEPCO breach"]
+INCIDENT_RE = re.compile(r"유출|해킹|침해|랜섬|다크웹|털렸|breach|leak|hack", re.IGNORECASE)
+
+# 비슷한 제목(같은 사건)은 한 번만 알림: 글자쌍 유사도 기준 (0~1, 높을수록 엄격)
+SIMILAR_TITLE = 0.5
+
+# 한 번 실행에 개별 알림 최대 건수 (넘는 건 한 메시지로 묶어서 보냄)
+MAX_PER_RUN = 5
 
 # 언론사 자체 RSS (전체기사 피드를 받아 키워드로 거름 → 네이버/구글보다 빠름)
 DIRECT_FEEDS = {
@@ -75,35 +77,7 @@ DIRECT_FEEDS = {
 # 랜섬웨어 유출 사이트 감시 (ransomware.live 공개 RSS, 다크웹 직접 접속 없음)
 RANSOMWARE_FEED = "https://www.ransomware.live/rss.xml"
 RANSOMWARE_WATCH = ["KEPCO", "Korea Electric Power", "kepco.co.kr", "한국전력", "한전"]
-RANSOMWARE_COUNTRY = "KR"   # ransomware.live에서 국내 피해기관 참고 알림
-
-# 공개 수집원만 사용합니다. 직접 다크웹·폐쇄 포럼에 접속하지 않습니다.
-PUBLIC_LEAK_FEEDS = {
-    "ransomlook.io": "https://www.ransomlook.io/rss.xml",
-    "threatcluster.io": "https://threatcluster.io/dark-web/feed.xml",
-}
-PUBLIC_FEED_ROOTS = {
-    "ransomlook.io": "https://www.ransomlook.io/recent",
-    "threatcluster.io": "https://threatcluster.io/dark-web",
-}
-# 일반 검색 결과와 별개로, 기관 + 유출/판매/해킹포럼 관련 공개 보도를 탐지
-PUBLIC_INTEL_QUERIES = (
-    '"KEPCO" "BreachForums"',
-    '"KEPCO" "data leak"',
-    '"kepco.co.kr" "breach"',
-    '"한국전력" "다크웹"',
-    '"한국전력" "개인정보 유출"',
-)
-LEAK_TERMS = re.compile(
-    r"breachforums|dark\s?web|leak(?:ed)?|breach|database|data\s?dump|"
-    r"stealer|for\s+sale|해킹|유출|다크웹|정보판매|판매글|계정탈취",
-    re.IGNORECASE,
-)
-# 신규 소스 도입 첫 성공 실행 시 과거 게시물은 기록만 하고 다음 신규 게시부터 알림
-BOOTSTRAP_SOURCES = {"ransomlook.io", "threatcluster.io", "public-intel.google", "hibp"}
-SOURCE_READY = set()
-EXTRA_MARKERS = set()
-
+RANSOMWARE_COUNTRY = "KR"   # 이 국가 피해 기관은 📎 참고로 알림 ("" 이면 끔)
 
 # ── 키워드 / 계열사 제외 ──
 AFFILIATES = [
@@ -149,59 +123,7 @@ def clean(text):
 
 
 def norm_title(title):
-    return re.sub(r"[\W_]+", "", title).casefold()
-
-
-def item_keys(it):
-    """과거 seen.json과 호환: GUID, URL, 원래 제목, 소문자 제목.
-
-    텔레그램은 전송 API의 idempotency key가 없어, 원격 저장 실패 시
-    exactly-once를 보장하지는 못한다.
-    """
-    keys = {str(it["id"])}
-    if it["outlet"] == "hibp":  # 계정 수가 같아도 API 결과가 바뀌면 재탐지
-        return keys
-    title = it["title"]
-    legacy_title = re.sub(r"[\W_]+", "", title)
-    if len(legacy_title) >= 8:
-        keys.update({"t:" + legacy_title, "t:" + legacy_title.casefold()})
-    link = it.get("link") or ""
-    if link.startswith(("https://", "http://")):
-        u = urllib.parse.urlsplit(link)
-        params = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
-        params = [(k, v) for k, v in params
-                  if not k.lower().startswith("utm_") and k.lower() not in ("fbclid", "gclid")]
-        canonical = urllib.parse.urlunsplit((u.scheme.lower(), u.netloc.lower(), u.path.rstrip("/"),
-                                            urllib.parse.urlencode(params), ""))
-        keys.add("u:" + canonical)
-    return keys
-
-
-def safe_feed_link(link, dom):
-    """유출 원본이나 onion URL이 아니라 공개 인텔 제공자의 링크만 전송."""
-    fallback = PUBLIC_FEED_ROOTS[dom]
-    try:
-        u = urllib.parse.urlparse(link or "")
-        host = (u.hostname or "").lower()
-        if u.scheme == "https" and (host == dom or host.endswith("." + dom)):
-            return link
-    except ValueError:
-        pass
-    return fallback
-
-
-def atomic_write_seen(keys):
-    """중간에 프로세스가 종료되어도 seen.json이 훼손되지 않도록 교체."""
-    markers = sorted({k for k in keys if k.startswith(("bootstrap:", "hibp:poll:"))}
-                     | EXTRA_MARKERS)
-    history = [k for k in keys if not k.startswith(("bootstrap:", "hibp:poll:"))]
-    # 과거 일자 HIBP 조회 마커는 보관할 필요 없음
-    today = datetime.now(KST).date().isoformat()
-    markers = [m for m in markers if not m.startswith("hibp:poll:") or m.endswith(":" + today)]
-    tmp = SEEN_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(history[-MAX_SEEN:] + markers, f, ensure_ascii=False)
-    os.replace(tmp, SEEN_FILE)
+    return re.sub(r"[\W_]+", "", title)
 
 
 def parse_date(s):
@@ -214,10 +136,7 @@ def parse_date(s):
         try:  # 데일리시큐 형식: 2026-11-23 10:27:27 (시간대 없음 = KST)
             d = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
         except Exception:
-            try:
-                d = datetime.fromisoformat(s.replace("Z", "+00:00"))
-            except ValueError:
-                return None
+            return None
     return d if d.tzinfo else d.replace(tzinfo=KST)
 
 
@@ -239,9 +158,9 @@ def log_source(name, ok, n=0, note=""):
     progress(f"{name}: {'성공' if ok else '실패'} {n}건 {note}")
 
 
-def item(id_, title, link, dom, date, via, kind=None):
+def item(id_, title, link, dom, date, via, kind=None, src_name=None):
     return {"id": id_ or link, "title": title, "link": link, "outlet": dom,
-            "date": date, "via": via, "kind": kind}  # kind: 미리 정한 알림 종류 (다크웹용)
+            "date": date, "via": via, "kind": kind, "src_name": src_name}  # kind: 미리 정한 알림 종류 (다크웹용)
 
 
 def fetch_direct():
@@ -274,7 +193,7 @@ def fetch_ransomware():
                 else ("?", title)
             desc = clean(it.findtext("description"))
             country = (it.findtext("category") or "").strip().upper()
-            if watch_re.search(AFFIL_RE.sub(" ", victim)) or watch_re.search(AFFIL_RE.sub(" ", desc)):
+            if watch_re.search(victim) or watch_re.search(desc):
                 kind = "both"            # 한전 관련 피해 → 🚨
             elif RANSOMWARE_COUNTRY and country == RANSOMWARE_COUNTRY:
                 kind = "topic"           # 국내 피해 기관 → 📎 참고
@@ -289,121 +208,6 @@ def fetch_ransomware():
     except Exception as e:
         log_source("랜섬웨어 유출 사이트", False, 0, str(e)[:120])
     return items
-
-
-def fetch_public_leaks():
-    """공개 피해 주장 RSS. 게시글 자체를 확인하는 것이 아니며 유출 확정 아님."""
-    watch_re = re.compile("|".join(map(re.escape, RANSOMWARE_WATCH)), re.IGNORECASE)
-    results = []
-    for dom, url in PUBLIC_LEAK_FEEDS.items():
-        try:
-            raw = list(ET.fromstring(http_get(url)).iter("item"))
-            matches = []
-            for entry in raw:
-                title = clean(entry.findtext("title"))
-                desc = clean(entry.findtext("description"))
-                text = title + " " + desc
-                # 계열사 명칭을 제거해 모회사 피해로 오인하는 것을 줄임
-                if not watch_re.search(AFFIL_RE.sub(" ", text)):
-                    continue
-                raw_link = (entry.findtext("link") or "").strip()
-                link = safe_feed_link(raw_link, dom)
-                ident = (entry.findtext("guid") or raw_link or title).strip()
-                matches.append(item(f"{dom}:{ident}", f"유출 게시 주장: {title}",
-                                    link, dom, parse_date(entry.findtext("pubDate")),
-                                    "공개 유출정보 RSS", "both"))
-            results += matches
-            SOURCE_READY.add(dom)
-            log_source(OUTLETS[dom][0] + " RSS", True, len(matches),
-                       f"전체 {len(raw)}건 중 기관 연관 {len(matches)}건 (주장·미확인)")
-        except Exception as exc:
-            log_source(OUTLETS[dom][0] + " RSS", False, 0, str(exc)[:120])
-    return results
-
-
-def fetch_public_intel():
-    """해킹포럼·유출정보를 다룬 공개 보도 검색. 실제 포럼 직접 수집 아님."""
-    results = []
-    any_success = False
-    for query in PUBLIC_INTEL_QUERIES:
-        try:
-            url = ("https://news.google.com/rss/search?q=" +
-                   urllib.parse.quote(query + " when:7d") + "&hl=ko&gl=KR&ceid=KR:ko")
-            raw = list(ET.fromstring(http_get(url)).iter("item"))
-            matches = []
-            for entry in raw:
-                title = clean(entry.findtext("title"))
-                desc = clean(entry.findtext("description"))
-                # 검색엔진이 본문 일치로 반환한 무관 결과를 배제
-                company = bool(COMPANY_RE.search(AFFIL_RE.sub(" ", title + " " + desc)) or
-                               re.search(r"kepco\.co\.kr|Korea Electric Power", title + " " + desc,
-                                         re.IGNORECASE))
-                if not company or not LEAK_TERMS.search(title + " " + desc):
-                    continue
-                link = (entry.findtext("link") or "").strip()
-                title = re.sub(r"\s+-\s+[^-]+$", "", title).strip()
-                ident = (entry.findtext("guid") or link or title).strip()
-                matches.append(item(f"google-intel:{ident}", title, link,
-                                    "public-intel.google", parse_date(entry.findtext("pubDate")),
-                                    "구글 공개 유출정보 검색", "both"))
-            results += matches
-            any_success = True
-            log_source("공개 유출보도 '" + query + "'", True, len(matches),
-                       f"전체 {len(raw)}건 중 기관·유출 키워드 동시 일치 {len(matches)}건")
-        except Exception as exc:
-            log_source("공개 유출보도 '" + query + "'", False, 0, str(exc)[:120])
-    if any_success:
-        SOURCE_READY.add("public-intel.google")
-    return results
-
-
-def fetch_hibp(seen_set):
-    """도메인 소유권 인증을 받은 HIBP 계정 유출 결과를 하루 1회 집계.
-
-    개별 이메일 주소, 비밀번호, 유출 데이터는 저장하거나 전송하지 않는다.
-    """
-    api_key = (os.getenv("HIBP_API_KEY") or "").strip()
-    domain = (os.getenv("HIBP_DOMAIN") or "").strip().lower()
-    if not api_key or not domain:
-        SOURCE_LOG.append(("HIBP 인증 도메인", "건너뜀", 0, "API 키·인증된 도메인 미설정"))
-        return []
-    if not re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+", domain):
-        log_source("HIBP 인증 도메인", False, 0, "HIBP_DOMAIN 도메인 형식 오류")
-        return []
-    marker = f"hibp:poll:{domain}:{datetime.now(KST).date().isoformat()}"
-    if marker in seen_set:
-        SOURCE_LOG.append(("HIBP 인증 도메인", "건너뜀", 0, "당일 조회 완료(하루 1회)"))
-        SOURCE_READY.add("hibp")
-        return []
-    try:
-        url = "https://haveibeenpwned.com/api/v3/breachedDomain/" + urllib.parse.quote(domain)
-        data = json.loads(http_get(url, {"hibp-api-key": api_key, "User-Agent": "KEPCO-Security-Watch/1.0"}))
-        if not isinstance(data, dict):
-            raise ValueError("예상과 다른 HIBP 응답")
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            data = {}  # 유출 계정 없음 (정상 응답)
-        else:
-            log_source("HIBP 인증 도메인", False, 0,
-                       f"HTTP {exc.code}: 키·도메인 인증/구독 및 제한 확인")
-            return []
-    except Exception as exc:
-        log_source("HIBP 인증 도메인", False, 0, str(exc)[:120])
-        return []
-    # 계정명 자체를 이력에 남기지 않고 집계의 해시만 계산
-    pairs = sorted({(alias.lower(), str(breach)) for alias, breaches in data.items()
-                    if isinstance(breaches, list) for breach in breaches})
-    digest = hashlib.sha256(json.dumps(pairs, ensure_ascii=False).encode()).hexdigest()[:20]
-    EXTRA_MARKERS.add(marker)
-    SOURCE_READY.add("hibp")
-    log_source("HIBP 인증 도메인", True, len(data),
-               f"{domain}: 유출 계정 {len(data)}개 (상세정보 미저장, 하루 1회)")
-    if not pairs:
-        return []
-    title = f"{domain} 도메인 유출 계정 현황: 계정 {len(data)}개, 유출 기록 {len(pairs)}건"
-    return [item("hibp:" + domain + ":" + digest, title,
-                 "https://haveibeenpwned.com/DomainSearch", "hibp",
-                 datetime.now(timezone.utc), "HIBP 인증 도메인", "both")]
 
 
 def fetch_naver():
@@ -465,6 +269,52 @@ def fetch_google():
     return items
 
 
+def fetch_breach_news():
+    """감시 목록 밖 언론사까지: 제목에 한전 + 유출·해킹 단어가 함께 있는 기사"""
+    items = []
+    for kw in BREACH_QUERIES:
+        name = f"유출보도 '{kw}'"
+        try:
+            q = urllib.parse.quote(f"{kw} when:1d")
+            url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
+            raw = list(ET.fromstring(http_get(url)).iter("item"))
+            kept = 0
+            for it in raw:
+                src = it.find("source")
+                if outlet_of(src.get("url") if src is not None else ""):
+                    continue  # 감시 언론사는 기존 검색에서 처리
+                title = clean(it.findtext("title"))
+                sname = clean(src.text) if src is not None else ""
+                if sname and title.endswith(" - " + sname):
+                    title = title[: -len(sname) - 3]
+                if classify(title) not in ("company", "both") or not INCIDENT_RE.search(title):
+                    continue
+                kept += 1
+                items.append(item(it.findtext("guid"), title, it.findtext("link"), "_other",
+                                  parse_date(it.findtext("pubDate")), "구글", "both",
+                                  sname or "기타 언론"))
+            log_source(name, True, kept, f"전체 {len(raw)}건 중 한전+사고 제목 {kept}건")
+        except Exception as e:
+            log_source(name, False, 0, str(e)[:120])
+    return items
+
+
+def bigrams(t):
+    t = norm_title(t)
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def is_similar(title, seen_titles):
+    """이미 보낸 제목 중 비슷한 것이 있으면 True (같은 사건 반복 방지)"""
+    b = bigrams(title)
+    if not b:
+        return False
+    for o in seen_titles:
+        if o and len(b & o) / len(b | o) >= SIMILAR_TITLE:
+            return True
+    return False
+
+
 def send_text(text):
     token = os.environ["TELEGRAM_BOT_TOKEN"].strip()  # 붙여넣을 때 딸려온 줄바꿈·공백 제거
     chat = os.environ["TELEGRAM_CHAT_ID"].strip()
@@ -488,12 +338,12 @@ def send_text(text):
 
 def send_telegram(it):
     name, cat = OUTLETS[it["outlet"]]
+    name = it.get("src_name") or name
     when = it["date"].astimezone(KST).strftime("%m/%d %H:%M") if it["date"] else ""
     kind = it.get("kind") or classify(it["title"])
     icon = {"both": "🚨 한전+", "company": "⚡", "topic": "📎 참고"}[kind]
-    label = "출처 확인" if cat in ("유출정보", "유출계정", "공개위협보도") else "기사 보기"
     send_text(f"{icon} [{cat}] {html.escape(name)}\n<b>{html.escape(it['title'])}</b>\n{when}\n"
-              f"<a href=\"{html.escape(it['link'], quote=True)}\">{label}</a>")
+              f"<a href=\"{html.escape(it['link'])}\">기사 보기</a>")
 
 
 def tg_call(method, params=None):
@@ -543,9 +393,9 @@ def write_report(items, matched, new, sent, first_run, tg_errors, test_result=No
     lines = []
     if test_result:
         lines += ["## 텔레그램 진단", ""] + [f"- {l}" for l in test_result] + [""]
-    lines += ["## 1. 요청 결과 (출처별)", "", "| 출처 | 결과 | 수집·일치 건수 | 비고 |", "|---|---|---|---|"]
+    lines += ["## 1. 요청 결과 (출처별)", "", "| 출처 | 결과 | 받은 기사 | 비고 |", "|---|---|---|---|"]
     lines += [f"| {n} | {r} | {c} | {note} |" for n, r, c, note in SOURCE_LOG]
-    lines += ["", "## 2. 출처별 결과", "",
+    lines += ["", "## 2. 언론사별 결과", "",
               "| 분류 | 언론사 | 수집 | 키워드 일치 | 신규 | 전송 | 경로 |",
               "|---|---|---|---|---|---|---|"]
     for d, s in sorted(stats.items(), key=lambda x: (OUTLETS[x[0]][1], OUTLETS[x[0]][0])):
@@ -557,7 +407,7 @@ def write_report(items, matched, new, sent, first_run, tg_errors, test_result=No
     if tg_errors:
         lines += ["", "**텔레그램 전송 오류**", ""] + [f"- {e}" for e in tg_errors[:5]]
     if new:
-        lines += ["", "## 3. 신규 감지 항목", ""]
+        lines += ["", "## 3. 신규 기사", ""]
         lines += [f"- [{OUTLETS[it['outlet']][0]}] {it['title']} ({it['via']})" for it in new[:50]]
 
     report = "\n".join(lines)
@@ -578,76 +428,80 @@ def main():
             progress(line)
 
     first_run = not os.path.exists(SEEN_FILE)
-    if first_run:
-        seen = []
-    else:
-        with open(SEEN_FILE, encoding="utf-8") as f:
-            seen = json.load(f)
-        if not isinstance(seen, list):
-            raise ValueError("seen.json은 문자열 목록이어야 합니다")
+    seen = [] if first_run else json.load(open(SEEN_FILE, encoding="utf-8"))
     seen_set = set(seen)
 
-    # 공개 RSS 및 검색 결과만 수집. 통신 실패한 소스는 실패로 표시하고 계속 진행.
-    gathered = (fetch_direct() + fetch_ransomware() + fetch_public_leaks() +
-                fetch_naver() + fetch_google() + fetch_public_intel() + fetch_hibp(seen_set))
-    items = []
-    ids = set()
-    for it in gathered:
-        if it["id"] not in ids:
+    items, ids = [], set()
+    for it in fetch_direct() + fetch_ransomware() + fetch_naver() + fetch_google() \
+            + fetch_breach_news():  # 앞쪽 출처 우선
+        if it["id"] not in ids:  # 여러 키워드 검색에 같은 기사가 겹치면 하나로
             ids.add(it["id"])
             items.append(it)
 
     now = datetime.now(timezone.utc)
-    matched, new = [], []
-    baselined = 0
+    seen_titles = [bigrams(k[2:]) for k in seen if k.startswith("t:")]
+    matched, new, similar = [], [], 0
     for it in items:
         if not it["link"] or not (it["kind"] or is_target(it["title"])):
             continue
-        age = INTEL_MAX_AGE if it["outlet"] in BOOTSTRAP_SOURCES else MAX_AGE
-        if it["date"] and now - it["date"] > age:
+        if it["date"] and now - it["date"] > MAX_AGE:
             continue
         matched.append(it)
-        keys = item_keys(it)
+        keys = {it["id"], "t:" + norm_title(it["title"])}
         if keys & seen_set:
             continue
-        seen_set.update(keys)  # 이번 실행 내부 중복 제거
-        it["keys"] = keys
-        # 새로 추가한 공개 유출정보 피드: 첫 성공 조회는 과거자료 학습만
-        if it["outlet"] in BOOTSTRAP_SOURCES and "bootstrap:" + it["outlet"] not in seen:
-            seen.extend(sorted(keys))
-            baselined += 1
+        if is_similar(it["title"], seen_titles):  # 같은 사건의 비슷한 제목
+            similar += 1
             continue
+        seen_set |= keys  # 이번 실행 안에서 중복 방지
+        seen_titles.append(bigrams(it["title"]))
+        it["keys"] = keys
         new.append(it)
 
-    # 실패한 피드는 마커를 만들지 않아 다음 회차에 다시 초기화할 수 있게 함
-    for src in BOOTSTRAP_SOURCES & SOURCE_READY:
-        marker = "bootstrap:" + src
-        if marker not in seen_set:
-            seen.append(marker)
-            seen_set.add(marker)
-
     sent, tg_errors = 0, []
-    for it in sorted(new, key=lambda x: x["date"] or now):
-        if not first_run:
+    ordered = sorted(new, key=lambda x: x["date"] or now)
+    singles, extra = ordered[:MAX_PER_RUN], ordered[MAX_PER_RUN:]
+    blocked = False
+    for it in singles:
+        if not first_run:  # 첫 실행은 기록만 (알림 폭탄 방지)
             try:
                 progress(f"전송: {it['title'][:40]}")
                 send_telegram(it)
                 it["sent"] = True
                 sent += 1
-                time.sleep(1)
+                time.sleep(1)  # 연속 전송 속도 제한
             except Exception as e:
                 tg_errors.append(str(e)[:200])
                 if "429" in str(e) or "연결 실패" in str(e):
-                    tg_errors.append("텔레그램 제한으로 나머지 전송을 다음 실행으로 넘김")
+                    # 텔레그램이 막고 있으면 남은 기사는 이번엔 보내지 않고 다음 실행으로 넘김
+                    tg_errors.append("텔레그램 제한으로 이번 실행의 나머지 전송을 중단함")
+                    blocked = True
                     break
-                continue  # 실패한 기사는 기록하지 않아 다음 실행에서 재시도
-        seen.extend(sorted(it["keys"]))
+                continue  # 실패한 기사는 기록하지 않음 → 다음 실행 때 다시 시도
+        seen += list(it["keys"])
+    if extra and not blocked:
+        if not first_run:  # 많을 때는 나머지를 한 메시지로 묶음
+            lines = [f"📚 <b>관련 기사 {len(extra)}건 더</b>"]
+            for it in extra[:20]:
+                nm = it.get("src_name") or OUTLETS[it["outlet"]][0]
+                lines.append(f"• <a href=\"{html.escape(it['link'])}\">"
+                             f"{html.escape(it['title'][:60])}</a> ({html.escape(nm)})")
+            if len(extra) > 20:
+                lines.append(f"…외 {len(extra) - 20}건 (GitHub Summary 참고)")
+            try:
+                send_text("\n".join(lines))
+                for it in extra:
+                    it["sent"] = True
+                sent += len(extra)
+            except Exception as e:
+                tg_errors.append(str(e)[:200])
+                extra = []  # 실패 시 기록하지 않음
+        for it in extra:
+            seen += list(it["keys"])
 
-    atomic_write_seen(seen)
-    progress(f"완료 (신규 {len(new)} / 전송 {sent} / 신규 소스 초기기록 {baselined})")
+    json.dump(seen[-MAX_SEEN:], open(SEEN_FILE, "w", encoding="utf-8"), ensure_ascii=False)
+    progress(f"완료 (신규 {len(new)} / 전송 {sent} / 비슷한 제목 제외 {similar})")
     write_report(items, matched, new, sent, first_run, tg_errors, test_result)
-    if baselined:
-        progress(f"초기 등록된 공개 유출정보 {baselined}건은 이전 게시물이므로 알림 생략")
 
 
 if __name__ == "__main__":
