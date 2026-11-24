@@ -1,119 +1,508 @@
-# 한전 뉴스 알림 (kepco-news-alert)
+"""한국전력/한전 뉴스 알림 → 텔레그램
+- 대상: 지정 언론사(방송·통신·주요 일간지) + 보안 전문지
+- 한전 계열사 기사 제외
 
-한국전력·한전 관련 기사와 개인정보·다크웹 기사를 지정한 언론사에서 찾고, 랜섬웨어 유출 사이트에 한전이나 국내 기관이 올라오면 텔레그램으로 알려주는 GitHub Actions 봇입니다.
+환경변수
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (필수)
+  NAVER_CLIENT_ID, NAVER_CLIENT_SECRET  (선택: NAVER API HUB 키. 없으면 네이버는 건너뜀)
+"""
+import html
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
-## 동작 방식
+KST = timezone(timedelta(hours=9))
+SEEN_FILE = "seen.json"
+MAX_SEEN = 3000
+MAX_AGE = timedelta(hours=6)
 
-- **실행 주기:** 5분마다 자동 실행 (`cron: */5 * * * *`)
-  - GitHub 서버 상황에 따라 실제로는 5~15분 간격이 될 수 있습니다.
-- **판단 기준:** 기사 **제목**에 키워드가 있으면 알림을 보냅니다.
-- **중복 방지:** 보낸 기사는 `seen.json`에 기록해 다시 보내지 않습니다. 언론사가 달라도 제목이 같으면 한 번만 보냅니다.
-- **오래된 기사 제외:** 발행 후 6시간이 지난 기사는 보내지 않습니다.
-- **같은 사건 묶기:** 이미 보낸 제목과 매우 비슷한 제목은 보내지 않습니다 (`SIMILAR_TITLE`).
-- **알림 폭주 방지:** 한 번 실행에 개별 알림은 최대 5건이고, 나머지는 "📚 관련 기사 N건 더" 한 메시지로 묶어 보냅니다 (`MAX_PER_RUN`).
-- **첫 실행:** `seen.json`이 없을 때는 기존 기사를 기록만 하고 알림은 보내지 않습니다.
+# ── 감시 대상 언론사 (도메인: (표시명, 분류)) ── 필요하면 여기만 고치면 됨
+OUTLETS = {
+    # 방송·통신
+    "kbs.co.kr": ("KBS", "방송"),
+    "imbc.com": ("MBC", "방송"),
+    "sbs.co.kr": ("SBS", "방송"),
+    "ytn.co.kr": ("YTN", "방송"),
+    "jtbc.co.kr": ("JTBC", "방송"),
+    "mbn.co.kr": ("MBN", "방송"),
+    "ichannela.com": ("채널A", "방송"),
+    "tvchosun.com": ("TV조선", "방송"),
+    "yonhapnewstv.co.kr": ("연합뉴스TV", "방송"),
+    "yna.co.kr": ("연합뉴스", "통신"),
+    "newsis.com": ("뉴시스", "통신"),
+    "news1.kr": ("뉴스1", "통신"),
+    # 주요 일간지
+    "chosun.com": ("조선일보", "신문"),
+    "joongang.co.kr": ("중앙일보", "신문"),
+    "donga.com": ("동아일보", "신문"),
+    "hani.co.kr": ("한겨레", "신문"),
+    "khan.co.kr": ("경향신문", "신문"),
+    "hankookilbo.com": ("한국일보", "신문"),
+    "mk.co.kr": ("매일경제", "신문"),
+    "hankyung.com": ("한국경제", "신문"),
+    # 보안 전문지
+    "boannews.com": ("보안뉴스", "보안"),
+    "dailysecu.com": ("데일리시큐", "보안"),
+    "datanet.co.kr": ("데이터넷", "보안"),
+    # 다크웹 (랜섬웨어 조직 유출 사이트 모음)
+    "ransomware.live": ("랜섬웨어 유출", "다크웹"),
+    # 감시 목록 밖 언론사 (한전 + 유출·해킹 기사만)
+    "_other": ("기타 언론", "유출보도"),
+}
 
-## 키워드
+# 언론사 제한 없이 찾는 '한전 유출·해킹' 기사 (제목에 회사 + 사고 단어가 모두 있어야 알림)
+BREACH_QUERIES = ["한전 유출", "한국전력 유출", "한전 해킹", "한국전력 해킹", "KEPCO breach"]
+INCIDENT_RE = re.compile(r"유출|해킹|침해|랜섬|다크웹|털렸|breach|leak|hack", re.IGNORECASE)
 
-| 구분 | 키워드 | 알림 표시 |
-|---|---|---|
-| 회사 | 한전, 한국전력, 한국전력공사, KEPCO | ⚡ |
-| 참고 | 개인정보, 다크웹 | 📎 참고 |
-| 둘 다 | 회사 + 참고 키워드가 함께 있음 | 🚨 한전+ |
+# 비슷한 제목(같은 사건)은 한 번만 알림: 글자쌍 유사도 기준 (0~1, 높을수록 엄격)
+SIMILAR_TITLE = 0.5
 
-### 계열사 제외
+# 한 번 실행에 개별 알림 최대 건수 (넘는 건 한 메시지로 묶어서 보냄)
+MAX_PER_RUN = 5
 
-아래 계열사 이름은 회사 키워드에서 제외합니다. 단, 제목에 개인정보·다크웹이 있으면 📎 참고로 알림이 갑니다.
+# 언론사 자체 RSS (전체기사 피드를 받아 키워드로 거름 → 네이버/구글보다 빠름)
+DIRECT_FEEDS = {
+    "boannews.com": "https://www.boannews.com/rss/allArticle.xml",
+    "dailysecu.com": "https://www.dailysecu.com/rss/allArticle.xml",
+}
 
-한전KPS, 한전KDN, 한국전력기술(한전기술), 한전원자력연료, 한전MCS, 한전산업개발, 한전ENS, 한전FMS, 한전CSC, 한전전력연구원, 한국전력거래소, 한국전력정보, KEPCO KPS/KDN/E&C/NF/ENS/MCS
+# 랜섬웨어 유출 사이트 감시 (ransomware.live 공개 RSS, 다크웹 직접 접속 없음)
+RANSOMWARE_FEED = "https://www.ransomware.live/rss.xml"
+RANSOMWARE_WATCH = ["KEPCO", "Korea Electric Power", "kepco.co.kr", "한국전력", "한전"]
+RANSOMWARE_COUNTRY = "KR"   # 이 국가 피해 기관은 📎 참고로 알림 ("" 이면 끔)
 
-## 다크웹 (랜섬웨어 유출 사이트) 감시
+# ── 키워드 / 계열사 제외 ──
+AFFILIATES = [
+    "한국전력기술", "한국전력거래소", "한국전력정보",
+    "한전KPS", "한전케이피에스", "한전KDN", "한전케이디엔",
+    "한전기술", "한전원자력연료", "한전MCS", "한전엠씨에스",
+    "한전산업개발", "한전ENS", "한전FMS", "한전CSC", "한전전력연구원",
+]
+COMPANY_KEYWORDS = ["한국전력공사", "한국전력", "한전", "KEPCO"]  # 계열사 제외 적용
+TOPIC_KEYWORDS = ["개인정보", "다크웹"]                          # 참고용 (단독으로도 알림)
 
-랜섬웨어 조직이 유출 사이트에 새 피해 기관을 올리면 ransomware.live가 이를 모아 공개합니다. 이 피드를 확인해 아래 경우 알림을 보냅니다.
+COMPANY_RE = re.compile("|".join(map(re.escape, COMPANY_KEYWORDS)), re.IGNORECASE)
+TOPIC_RE = re.compile("|".join(map(re.escape, TOPIC_KEYWORDS)), re.IGNORECASE)
+AFFIL_RE = re.compile(
+    "|".join(sorted(map(re.escape, AFFILIATES), key=len, reverse=True))
+    + r"|KEPCO[\s\-]?(?:KPS|KDN|E&C|NF|ENS|MCS)",
+    re.IGNORECASE)
 
-| 조건 | 알림 표시 |
-|---|---|
-| 피해 기관명·설명에 KEPCO, Korea Electric Power, kepco.co.kr, 한국전력, 한전 포함 | 🚨 한전+ [다크웹] |
-| 피해 기관 국가가 한국(KR) | 📎 참고 [다크웹] |
 
-감시 단어는 `RANSOMWARE_WATCH`, 국가 조건은 `RANSOMWARE_COUNTRY`에서 바꿀 수 있습니다 (`""`로 두면 국내 기관 알림 끔).
+def classify(title):
+    """'both' | 'company' | 'topic' | None"""
+    company = bool(COMPANY_RE.search(AFFIL_RE.sub(" ", title)))
+    topic = bool(TOPIC_RE.search(title))
+    if company and topic:
+        return "both"
+    return "company" if company else "topic" if topic else None
 
-## 감시 언론사
 
-| 분류 | 언론사 |
-|---|---|
-| 방송 | KBS, MBC, SBS, YTN, JTBC, MBN, 채널A, TV조선, 연합뉴스TV |
-| 통신 | 연합뉴스, 뉴시스, 뉴스1 |
-| 신문 | 조선일보, 중앙일보, 동아일보, 한겨레, 경향신문, 한국일보, 매일경제, 한국경제 |
-| 보안 | 보안뉴스, 데일리시큐, 데이터넷 |
-| 다크웹 | 랜섬웨어 유출 사이트 (ransomware.live 공개 피드) |
-| 유출보도 | 위 목록 밖 모든 언론사 중 제목에 한전 + 유출·해킹·침해 등이 함께 있는 기사 |
+def is_target(title):
+    return classify(title) is not None
 
-## 기사 수집 경로
 
-| 경로 | 대상 | 비고 |
-|---|---|---|
-| 언론사 RSS 직접 요청 | 보안뉴스, 데일리시큐 | 전체기사 피드를 받아 키워드로 거름 (가장 빠름) |
-| 구글 뉴스 RSS | 위 언론사 전체 | 키워드별로 검색한 뒤 대상 언론사만 남김 |
-| 구글 뉴스 '유출보도' 검색 | 모든 언론사 | 한전 유출·해킹 검색 후 제목에 회사 + 사고 단어가 모두 있는 기사만 (`BREACH_QUERIES`) |
-| ransomware.live RSS | 랜섬웨어 유출 사이트 | 다크웹에 직접 접속하지 않고 공개 집계 피드 사용 |
-| 네이버 뉴스 API (선택) | 위 언론사 전체 | NAVER API HUB 키를 등록한 경우에만 사용 |
+def outlet_of(url):
+    host = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    for dom in OUTLETS:
+        if host == dom or host.endswith("." + dom):
+            return dom
+    return None
 
-## 파일 구성
 
-```
-kepco_alert.py                      # 기사 수집·필터·텔레그램 전송
-.github/workflows/kepco-alert.yml   # 5분마다 실행하는 설정
-seen.json                           # 보낸 기사 기록 (자동 생성·갱신, 직접 수정 X)
-README.md                           # 이 문서
-```
+def clean(text):
+    return html.unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
 
-외부 라이브러리를 쓰지 않으므로 `requirements.txt`는 필요 없습니다.
 
-## 설정 (Settings → Secrets and variables → Actions)
+def norm_title(title):
+    return re.sub(r"[\W_]+", "", title)
 
-| 이름 | 필수 | 내용 |
-|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | 필수 | BotFather에서 받은 봇 토큰 |
-| `TELEGRAM_CHAT_ID` | 필수 | 알림방 채팅 ID (`-100`으로 시작하는 음수) |
-| `NAVER_CLIENT_ID` | 선택 | NAVER API HUB Client ID |
-| `NAVER_CLIENT_SECRET` | 선택 | NAVER API HUB Client Secret |
 
-추가 설정:
-- Settings → Actions → General → Workflow permissions → **Read and write permissions** (`seen.json` 저장용)
-- 저장소는 **Public** 권장 (비공개는 무료 실행 시간 월 2,000분 초과)
+def parse_date(s):
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        d = parsedate_to_datetime(s)
+    except Exception:
+        try:  # 데일리시큐 형식: 2026-11-23 10:27:27 (시간대 없음 = KST)
+            d = datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+    return d if d.tzinfo else d.replace(tzinfo=KST)
 
-## 텔레그램 연결 테스트
 
-Actions → KEPCO news alert → **Run workflow**에서 **텔레그램 테스트 메시지 보내기**를 체크하고 실행하면 3단계 진단(① 토큰 ② 알림방 ③ 메시지 전송)을 하고 알림방에 ✅ 테스트 메시지를 보냅니다. 결과는 Summary 맨 위 **텔레그램 진단**에 표시됩니다. 뉴스 확인은 평소대로 함께 실행됩니다.
+def http_get(url, headers=None):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read()
 
-## 실행 결과 확인
 
-Actions 탭에서 실행을 누르면 **Summary**에 표가 나옵니다.
+SOURCE_LOG = []  # 요청 단위 로그: (출처, 결과, 받은 기사 수, 비고)
 
-1. **요청 결과 (출처별):** RSS·구글·네이버 요청의 성공/실패/건너뜀과 실패 사유
-2. **언론사별 결과:** 언론사마다 수집 / 키워드 일치 / 신규 / 전송 건수와 수집 경로
-3. **신규 기사:** 이번 실행에서 새로 잡힌 기사 목록
 
-## 자주 바꾸는 설정 (`kepco_alert.py` 상단)
+def progress(msg):
+    print(f"[{datetime.now(KST).strftime('%H:%M:%S')}] {msg}", flush=True)
 
-| 바꿀 것 | 수정할 곳 |
-|---|---|
-| 회사 키워드 | `COMPANY_KEYWORDS` |
-| 참고 키워드 | `TOPIC_KEYWORDS` |
-| 제외할 계열사 | `AFFILIATES` |
-| 감시 언론사 | `OUTLETS` (`"도메인": ("표시명", "분류")` 형식으로 한 줄 추가/삭제) |
-| 직접 RSS 피드 | `DIRECT_FEEDS` |
-| 다크웹 감시 단어 / 국가 | `RANSOMWARE_WATCH` / `RANSOMWARE_COUNTRY` |
-| 오래된 기사 기준 | `MAX_AGE` (기본 6시간) |
-| 실행 주기 | `kepco-alert.yml`의 `cron` (최소 5분) |
 
-## 문제 해결
+def log_source(name, ok, n=0, note=""):
+    SOURCE_LOG.append((name, "성공" if ok else "실패", n, note))
+    progress(f"{name}: {'성공' if ok else '실패'} {n}건 {note}")
 
-| 증상 | 확인할 것 |
-|---|---|
-| 실행은 성공인데 알림이 없음 | Summary의 신규 건수 확인. 0이면 새 기사가 없는 것 (정상) |
-| 같은 기사가 반복해서 옴 | Workflow permissions가 Read and write인지 확인 |
-| 텔레그램 전송 오류 | 토큰·채팅 ID 확인, 봇이 알림방에 들어가 있는지 확인 |
-| 특정 출처가 계속 실패 | Summary 표 1의 비고(실패 사유) 확인 |
-| 자동 실행이 멈춤 | Actions 탭에서 워크플로가 비활성화되지 않았는지 확인 |
+
+def item(id_, title, link, dom, date, via, kind=None, src_name=None):
+    return {"id": id_ or link, "title": title, "link": link, "outlet": dom,
+            "date": date, "via": via, "kind": kind, "src_name": src_name}  # kind: 미리 정한 알림 종류 (다크웹용)
+
+
+def fetch_direct():
+    items = []
+    for dom, url in DIRECT_FEEDS.items():
+        name = f"RSS {OUTLETS[dom][0]}"
+        try:
+            got = []
+            for it in ET.fromstring(http_get(url)).iter("item"):
+                link = (it.findtext("link") or "").strip()
+                got.append(item(link, clean(it.findtext("title")), link, dom,
+                                parse_date(it.findtext("pubDate")), "RSS"))
+            items += got
+            log_source(name, True, len(got), "전체기사 피드")
+        except Exception as e:
+            log_source(name, False, 0, str(e)[:120])
+    return items
+
+
+def fetch_ransomware():
+    """랜섬웨어 조직이 유출 사이트에 새 피해 기관을 올리면 감지"""
+    watch_re = re.compile("|".join(map(re.escape, RANSOMWARE_WATCH)), re.IGNORECASE)
+    items = []
+    try:
+        raw = list(ET.fromstring(http_get(RANSOMWARE_FEED)).iter("item"))
+        for it in raw:
+            title = clean(it.findtext("title"))
+            m = re.search(r"(.+?) has just published a new victim\s*:\s*(.+)", title)
+            group, victim = (m.group(1).replace("🏴‍☠️", "").strip(), m.group(2).strip()) if m \
+                else ("?", title)
+            desc = clean(it.findtext("description"))
+            country = (it.findtext("category") or "").strip().upper()
+            if watch_re.search(victim) or watch_re.search(desc):
+                kind = "both"            # 한전 관련 피해 → 🚨
+            elif RANSOMWARE_COUNTRY and country == RANSOMWARE_COUNTRY:
+                kind = "topic"           # 국내 피해 기관 → 📎 참고
+            else:
+                continue
+            items.append(item(it.findtext("guid") or it.findtext("link"),
+                              f"랜섬웨어 '{group}' 유출 사이트에 '{victim}' 게시 ({country})",
+                              (it.findtext("link") or "").strip(), "ransomware.live",
+                              parse_date(it.findtext("pubDate")), "다크웹", kind))
+        log_source("랜섬웨어 유출 사이트", True, len(items),
+                   f"전체 {len(raw)}건 중 감시 대상 {len(items)}건")
+    except Exception as e:
+        log_source("랜섬웨어 유출 사이트", False, 0, str(e)[:120])
+    return items
+
+
+def fetch_naver():
+    cid = (os.getenv("NAVER_CLIENT_ID") or "").strip()
+    secret = (os.getenv("NAVER_CLIENT_SECRET") or "").strip()
+    if not (cid and secret):
+        SOURCE_LOG.append(("네이버 API", "건너뜀", 0, "키 미등록"))
+        return []
+    items = []
+    for kw in ("한국전력", "한전", "KEPCO", *TOPIC_KEYWORDS):
+        name = f"네이버 '{kw}'"
+        try:
+            # NAVER API HUB (2026.7.31부터 신규 키는 여기서만 발급)
+            url = ("https://naverapihub.apigw.ntruss.com/search/v1/news"
+                   "?display=100&sort=date&format=json&query=" + urllib.parse.quote(kw))
+            data = json.loads(http_get(url, {"X-NCP-APIGW-API-KEY-ID": cid,
+                                             "X-NCP-APIGW-API-KEY": secret}))
+            raw = data.get("items", [])
+            kept = 0
+            for it in raw:
+                orig = it.get("originallink") or ""
+                dom = outlet_of(orig)
+                if dom:
+                    kept += 1
+                    items.append(item(orig, clean(it.get("title")), orig or it.get("link"),
+                                      dom, parse_date(it.get("pubDate")), "네이버"))
+            log_source(name, True, kept, f"전체 {len(raw)}건 중 대상 언론사 {kept}건")
+        except Exception as e:
+            log_source(name, False, 0, str(e)[:120])
+    return items
+
+
+def fetch_google():
+    # 키워드별로 따로 검색한 뒤 대상 언론사만 남김
+    # (언론사 site: 조건을 한 번에 묶으면 키워드가 무시된 결과가 섞여 나옴)
+    items = []
+    for kw in ("한국전력", "한전", "KEPCO", *TOPIC_KEYWORDS):
+        name = f"구글 '{kw}'"
+        try:
+            q = urllib.parse.quote(f'"{kw}" when:1d')
+            url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
+            raw = list(ET.fromstring(http_get(url)).iter("item"))
+            kept = 0
+            for it in raw:
+                src = it.find("source")
+                dom = outlet_of(src.get("url") if src is not None else "")
+                if not dom:
+                    continue
+                title = clean(it.findtext("title"))
+                sname = clean(src.text) if src is not None else ""
+                if sname and title.endswith(" - " + sname):
+                    title = title[: -len(sname) - 3]
+                kept += 1
+                items.append(item(it.findtext("guid"), title, it.findtext("link"), dom,
+                                  parse_date(it.findtext("pubDate")), "구글"))
+            log_source(name, True, kept, f"전체 {len(raw)}건 중 대상 언론사 {kept}건")
+        except Exception as e:
+            log_source(name, False, 0, str(e)[:120])
+    return items
+
+
+def fetch_breach_news():
+    """감시 목록 밖 언론사까지: 제목에 한전 + 유출·해킹 단어가 함께 있는 기사"""
+    items = []
+    for kw in BREACH_QUERIES:
+        name = f"유출보도 '{kw}'"
+        try:
+            q = urllib.parse.quote(f"{kw} when:1d")
+            url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
+            raw = list(ET.fromstring(http_get(url)).iter("item"))
+            kept = 0
+            for it in raw:
+                src = it.find("source")
+                if outlet_of(src.get("url") if src is not None else ""):
+                    continue  # 감시 언론사는 기존 검색에서 처리
+                title = clean(it.findtext("title"))
+                sname = clean(src.text) if src is not None else ""
+                if sname and title.endswith(" - " + sname):
+                    title = title[: -len(sname) - 3]
+                if classify(title) not in ("company", "both") or not INCIDENT_RE.search(title):
+                    continue
+                kept += 1
+                items.append(item(it.findtext("guid"), title, it.findtext("link"), "_other",
+                                  parse_date(it.findtext("pubDate")), "구글", "both",
+                                  sname or "기타 언론"))
+            log_source(name, True, kept, f"전체 {len(raw)}건 중 한전+사고 제목 {kept}건")
+        except Exception as e:
+            log_source(name, False, 0, str(e)[:120])
+    return items
+
+
+def bigrams(t):
+    t = norm_title(t)
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+def is_similar(title, seen_titles):
+    """이미 보낸 제목 중 비슷한 것이 있으면 True (같은 사건 반복 방지)"""
+    b = bigrams(title)
+    if not b:
+        return False
+    for o in seen_titles:
+        if o and len(b & o) / len(b | o) >= SIMILAR_TITLE:
+            return True
+    return False
+
+
+def send_text(text):
+    token = os.environ["TELEGRAM_BOT_TOKEN"].strip()  # 붙여넣을 때 딸려온 줄바꿈·공백 제거
+    chat = os.environ["TELEGRAM_CHAT_ID"].strip()
+    body = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML",
+                                   "disable_web_page_preview": "false"}).encode()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    for attempt in range(2):
+        try:
+            urllib.request.urlopen(url, body, timeout=15)
+            return
+        except urllib.error.HTTPError as e:  # 텔레그램이 알려주는 실제 사유까지 남김
+            # 429(요청 제한)는 기다려도 소용없는 경우가 많아 바로 실패 처리
+            raise Exception(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}")
+        except (TimeoutError, urllib.error.URLError) as e:
+            if attempt == 0:
+                progress("텔레그램 응답 없음 → 3초 뒤 1회 재시도")
+                time.sleep(3)
+                continue
+            raise Exception(f"연결 실패: {e}")
+
+
+def send_telegram(it):
+    name, cat = OUTLETS[it["outlet"]]
+    name = it.get("src_name") or name
+    when = it["date"].astimezone(KST).strftime("%m/%d %H:%M") if it["date"] else ""
+    kind = it.get("kind") or classify(it["title"])
+    icon = {"both": "🚨 한전+", "company": "⚡", "topic": "📎 참고"}[kind]
+    send_text(f"{icon} [{cat}] {html.escape(name)}\n<b>{html.escape(it['title'])}</b>\n{when}\n"
+              f"<a href=\"{html.escape(it['link'])}\">기사 보기</a>")
+
+
+def tg_call(method, params=None):
+    """텔레그램 API 호출 결과를 (성공여부, 내용)으로 반환 (진단용)"""
+    token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(params).encode() if params else None
+    try:
+        with urllib.request.urlopen(url, data, timeout=15) as r:
+            return True, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}"
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def send_test_message():
+    """3단계 진단: ① 토큰(getMe) ② 방 확인(getChat) ③ 메시지 전송"""
+    chat = os.environ["TELEGRAM_CHAT_ID"].strip()
+    out = []
+    ok, r = tg_call("getMe")
+    out.append(f"① 토큰 확인: " + (f"성공 — 봇 @{r['result']['username']}" if ok else f"실패 — {r}"))
+    ok, r = tg_call("getChat", {"chat_id": chat})
+    out.append(f"② 알림방 확인: " + (f"성공 — '{r['result'].get('title', '')}' ({r['result']['type']})"
+                                  if ok else f"실패 — {r}"))
+    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    try:
+        send_text(f"✅ <b>테스트 메시지</b>\n한전 뉴스 알림 봇이 이 방에 정상 연결됐습니다.\n{now}")
+        out.append("③ 메시지 전송: 성공 (텔레그램 방을 확인하세요)")
+    except Exception as e:
+        out.append(f"③ 메시지 전송: 실패 — {str(e)[:200]}")
+    return out
+
+
+def write_report(items, matched, new, sent, first_run, tg_errors, test_result=None):
+    stats = {d: {"fetched": 0, "matched": 0, "new": 0, "sent": 0, "via": set()} for d in OUTLETS}
+    for it in items:
+        stats[it["outlet"]]["fetched"] += 1
+        stats[it["outlet"]]["via"].add(it["via"])
+    for it in matched:
+        stats[it["outlet"]]["matched"] += 1
+    for it in new:
+        stats[it["outlet"]]["new"] += 1
+        if it.get("sent"):
+            stats[it["outlet"]]["sent"] += 1
+
+    lines = []
+    if test_result:
+        lines += ["## 텔레그램 진단", ""] + [f"- {l}" for l in test_result] + [""]
+    lines += ["## 1. 요청 결과 (출처별)", "", "| 출처 | 결과 | 받은 기사 | 비고 |", "|---|---|---|---|"]
+    lines += [f"| {n} | {r} | {c} | {note} |" for n, r, c, note in SOURCE_LOG]
+    lines += ["", "## 2. 언론사별 결과", "",
+              "| 분류 | 언론사 | 수집 | 키워드 일치 | 신규 | 전송 | 경로 |",
+              "|---|---|---|---|---|---|---|"]
+    for d, s in sorted(stats.items(), key=lambda x: (OUTLETS[x[0]][1], OUTLETS[x[0]][0])):
+        name, cat = OUTLETS[d]
+        lines.append(f"| {cat} | {name} | {s['fetched']} | {s['matched']} | {s['new']} | "
+                     f"{s['sent']} | {', '.join(sorted(s['via'])) or '-'} |")
+    lines += ["", f"**합계** 수집 {len(items)} · 키워드 일치 {len(matched)} · 신규 {len(new)} · "
+                  f"전송 {sent} · 첫 실행 {'예(기록만)' if first_run else '아니오'}"]
+    if tg_errors:
+        lines += ["", "**텔레그램 전송 오류**", ""] + [f"- {e}" for e in tg_errors[:5]]
+    if new:
+        lines += ["", "## 3. 신규 기사", ""]
+        lines += [f"- [{OUTLETS[it['outlet']][0]}] {it['title']} ({it['via']})" for it in new[:50]]
+
+    report = "\n".join(lines)
+    print(report)
+    summary = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary:  # Actions 실행 화면 Summary에 표로 표시
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write(report + "\n")
+
+
+def main():
+    progress("시작")
+    test_result = None
+    if os.getenv("TEST_MESSAGE", "").lower() == "true":
+        progress("텔레그램 진단 중")
+        test_result = send_test_message()
+        for line in test_result:
+            progress(line)
+
+    first_run = not os.path.exists(SEEN_FILE)
+    seen = [] if first_run else json.load(open(SEEN_FILE, encoding="utf-8"))
+    seen_set = set(seen)
+
+    items, ids = [], set()
+    for it in fetch_direct() + fetch_ransomware() + fetch_naver() + fetch_google() \
+            + fetch_breach_news():  # 앞쪽 출처 우선
+        if it["id"] not in ids:  # 여러 키워드 검색에 같은 기사가 겹치면 하나로
+            ids.add(it["id"])
+            items.append(it)
+
+    now = datetime.now(timezone.utc)
+    seen_titles = [bigrams(k[2:]) for k in seen if k.startswith("t:")]
+    matched, new, similar = [], [], 0
+    for it in items:
+        if not it["link"] or not (it["kind"] or is_target(it["title"])):
+            continue
+        if it["date"] and now - it["date"] > MAX_AGE:
+            continue
+        matched.append(it)
+        keys = {it["id"], "t:" + norm_title(it["title"])}
+        if keys & seen_set:
+            continue
+        if is_similar(it["title"], seen_titles):  # 같은 사건의 비슷한 제목
+            similar += 1
+            continue
+        seen_set |= keys  # 이번 실행 안에서 중복 방지
+        seen_titles.append(bigrams(it["title"]))
+        it["keys"] = keys
+        new.append(it)
+
+    sent, tg_errors = 0, []
+    ordered = sorted(new, key=lambda x: x["date"] or now)
+    singles, extra = ordered[:MAX_PER_RUN], ordered[MAX_PER_RUN:]
+    blocked = False
+    for it in singles:
+        if not first_run:  # 첫 실행은 기록만 (알림 폭탄 방지)
+            try:
+                progress(f"전송: {it['title'][:40]}")
+                send_telegram(it)
+                it["sent"] = True
+                sent += 1
+                time.sleep(1)  # 연속 전송 속도 제한
+            except Exception as e:
+                tg_errors.append(str(e)[:200])
+                if "429" in str(e) or "연결 실패" in str(e):
+                    # 텔레그램이 막고 있으면 남은 기사는 이번엔 보내지 않고 다음 실행으로 넘김
+                    tg_errors.append("텔레그램 제한으로 이번 실행의 나머지 전송을 중단함")
+                    blocked = True
+                    break
+                continue  # 실패한 기사는 기록하지 않음 → 다음 실행 때 다시 시도
+        seen += list(it["keys"])
+    if extra and not blocked:
+        if not first_run:  # 많을 때는 나머지를 한 메시지로 묶음
+            lines = [f"📚 <b>관련 기사 {len(extra)}건 더</b>"]
+            for it in extra[:20]:
+                nm = it.get("src_name") or OUTLETS[it["outlet"]][0]
+                lines.append(f"• <a href=\"{html.escape(it['link'])}\">"
+                             f"{html.escape(it['title'][:60])}</a> ({html.escape(nm)})")
+            if len(extra) > 20:
+                lines.append(f"…외 {len(extra) - 20}건 (GitHub Summary 참고)")
+            try:
+                send_text("\n".join(lines))
+                for it in extra:
+                    it["sent"] = True
+                sent += len(extra)
+            except Exception as e:
+                tg_errors.append(str(e)[:200])
+                extra = []  # 실패 시 기록하지 않음
+        for it in extra:
+            seen += list(it["keys"])
+
+    json.dump(seen[-MAX_SEEN:], open(SEEN_FILE, "w", encoding="utf-8"), ensure_ascii=False)
+    progress(f"완료 (신규 {len(new)} / 전송 {sent} / 비슷한 제목 제외 {similar})")
+    write_report(items, matched, new, sent, first_run, tg_errors, test_result)
+
+
+if __name__ == "__main__":
+    main()
