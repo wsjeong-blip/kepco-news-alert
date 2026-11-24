@@ -52,6 +52,8 @@ OUTLETS = {
     "boannews.com": ("보안뉴스", "보안"),
     "dailysecu.com": ("데일리시큐", "보안"),
     "datanet.co.kr": ("데이터넷", "보안"),
+    # 다크웹 (랜섬웨어 조직 유출 사이트 모음)
+    "ransomware.live": ("랜섬웨어 유출", "다크웹"),
 }
 
 # 언론사 자체 RSS (전체기사 피드를 받아 키워드로 거름 → 네이버/구글보다 빠름)
@@ -59,6 +61,11 @@ DIRECT_FEEDS = {
     "boannews.com": "https://www.boannews.com/rss/allArticle.xml",
     "dailysecu.com": "https://www.dailysecu.com/rss/allArticle.xml",
 }
+
+# 랜섬웨어 유출 사이트 감시 (ransomware.live 공개 RSS, 다크웹 직접 접속 없음)
+RANSOMWARE_FEED = "https://www.ransomware.live/rss.xml"
+RANSOMWARE_WATCH = ["KEPCO", "Korea Electric Power", "kepco.co.kr", "한국전력", "한전"]
+RANSOMWARE_COUNTRY = "KR"   # 이 국가 피해 기관은 📎 참고로 알림 ("" 이면 끔)
 
 # ── 키워드 / 계열사 제외 ──
 AFFILIATES = [
@@ -139,9 +146,9 @@ def log_source(name, ok, n=0, note=""):
     progress(f"{name}: {'성공' if ok else '실패'} {n}건 {note}")
 
 
-def item(id_, title, link, dom, date, via):
+def item(id_, title, link, dom, date, via, kind=None):
     return {"id": id_ or link, "title": title, "link": link, "outlet": dom,
-            "date": date, "via": via}
+            "date": date, "via": via, "kind": kind}  # kind: 미리 정한 알림 종류 (다크웹용)
 
 
 def fetch_direct():
@@ -158,6 +165,36 @@ def fetch_direct():
             log_source(name, True, len(got), "전체기사 피드")
         except Exception as e:
             log_source(name, False, 0, str(e)[:120])
+    return items
+
+
+def fetch_ransomware():
+    """랜섬웨어 조직이 유출 사이트에 새 피해 기관을 올리면 감지"""
+    watch_re = re.compile("|".join(map(re.escape, RANSOMWARE_WATCH)), re.IGNORECASE)
+    items = []
+    try:
+        raw = list(ET.fromstring(http_get(RANSOMWARE_FEED)).iter("item"))
+        for it in raw:
+            title = clean(it.findtext("title"))
+            m = re.search(r"(.+?) has just published a new victim\s*:\s*(.+)", title)
+            group, victim = (m.group(1).replace("🏴‍☠️", "").strip(), m.group(2).strip()) if m \
+                else ("?", title)
+            desc = clean(it.findtext("description"))
+            country = (it.findtext("category") or "").strip().upper()
+            if watch_re.search(victim) or watch_re.search(desc):
+                kind = "both"            # 한전 관련 피해 → 🚨
+            elif RANSOMWARE_COUNTRY and country == RANSOMWARE_COUNTRY:
+                kind = "topic"           # 국내 피해 기관 → 📎 참고
+            else:
+                continue
+            items.append(item(it.findtext("guid") or it.findtext("link"),
+                              f"랜섬웨어 '{group}' 유출 사이트에 '{victim}' 게시 ({country})",
+                              (it.findtext("link") or "").strip(), "ransomware.live",
+                              parse_date(it.findtext("pubDate")), "다크웹", kind))
+        log_source("랜섬웨어 유출 사이트", True, len(items),
+                   f"전체 {len(raw)}건 중 감시 대상 {len(items)}건")
+    except Exception as e:
+        log_source("랜섬웨어 유출 사이트", False, 0, str(e)[:120])
     return items
 
 
@@ -244,7 +281,8 @@ def send_text(text):
 def send_telegram(it):
     name, cat = OUTLETS[it["outlet"]]
     when = it["date"].astimezone(KST).strftime("%m/%d %H:%M") if it["date"] else ""
-    icon = {"both": "🚨 한전+", "company": "⚡", "topic": "📎 참고"}[classify(it["title"])]
+    kind = it.get("kind") or classify(it["title"])
+    icon = {"both": "🚨 한전+", "company": "⚡", "topic": "📎 참고"}[kind]
     send_text(f"{icon} [{cat}] {html.escape(name)}\n<b>{html.escape(it['title'])}</b>\n{when}\n"
               f"<a href=\"{html.escape(it['link'])}\">기사 보기</a>")
 
@@ -335,7 +373,7 @@ def main():
     seen_set = set(seen)
 
     items, ids = [], set()
-    for it in fetch_direct() + fetch_naver() + fetch_google():  # 앞쪽 출처 우선
+    for it in fetch_direct() + fetch_ransomware() + fetch_naver() + fetch_google():  # 앞쪽 출처 우선
         if it["id"] not in ids:  # 여러 키워드 검색에 같은 기사가 겹치면 하나로
             ids.add(it["id"])
             items.append(it)
@@ -343,7 +381,7 @@ def main():
     now = datetime.now(timezone.utc)
     matched, new = [], []
     for it in items:
-        if not it["link"] or not is_target(it["title"]):
+        if not it["link"] or not (it["kind"] or is_target(it["title"])):
             continue
         if it["date"] and now - it["date"] > MAX_AGE:
             continue
