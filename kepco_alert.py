@@ -125,40 +125,61 @@ def http_get(url, headers=None):
         return r.read()
 
 
-def item(id_, title, link, dom, date):
-    return {"id": id_ or link, "title": title, "link": link, "outlet": dom, "date": date}
+SOURCE_LOG = []  # 요청 단위 로그: (출처, 결과, 받은 기사 수, 비고)
+
+
+def log_source(name, ok, n=0, note=""):
+    SOURCE_LOG.append((name, "성공" if ok else "실패", n, note))
+
+
+def item(id_, title, link, dom, date, via):
+    return {"id": id_ or link, "title": title, "link": link, "outlet": dom,
+            "date": date, "via": via}
 
 
 def fetch_direct():
     items = []
     for dom, url in DIRECT_FEEDS.items():
+        name = f"RSS {OUTLETS[dom][0]}"
         try:
+            got = []
             for it in ET.fromstring(http_get(url)).iter("item"):
                 link = (it.findtext("link") or "").strip()
-                items.append(item(link, clean(it.findtext("title")), link, dom,
-                                  parse_date(it.findtext("pubDate"))))
+                got.append(item(link, clean(it.findtext("title")), link, dom,
+                                parse_date(it.findtext("pubDate")), "RSS"))
+            items += got
+            log_source(name, True, len(got), "전체기사 피드")
         except Exception as e:
-            print(f"[warn] feed {dom}: {e}", file=sys.stderr)
+            log_source(name, False, 0, str(e)[:120])
     return items
 
 
 def fetch_naver():
     cid, secret = os.getenv("NAVER_CLIENT_ID"), os.getenv("NAVER_CLIENT_SECRET")
     if not (cid and secret):
+        SOURCE_LOG.append(("네이버 API", "건너뜀", 0, "키 미등록"))
         return []
     items = []
     for kw in ("한국전력", "한전", "KEPCO", *TOPIC_KEYWORDS):
-        # NAVER API HUB (2026.7.31부터 신규 키는 여기서만 발급)
-        url = ("https://naverapihub.apigw.ntruss.com/search/v1/news"
-               "?display=100&sort=date&format=json&query=" + urllib.parse.quote(kw))
-        data = json.loads(http_get(url, {"X-NCP-APIGW-API-KEY-ID": cid,
-                                         "X-NCP-APIGW-API-KEY": secret}))
-        for it in data.get("items", []):
-            orig = it.get("originallink") or ""
-            dom = outlet_of(orig)
-            if dom:
-                items.append(item(orig, clean(it.get("title")), orig or it.get("link"),
-                                  dom, parse_date(it.get("pubDate"))))
+        name = f"네이버 '{kw}'"
+        try:
+            # NAVER API HUB (2026.7.31부터 신규 키는 여기서만 발급)
+            url = ("https://naverapihub.apigw.ntruss.com/search/v1/news"
+                   "?display=100&sort=date&format=json&query=" + urllib.parse.quote(kw))
+            data = json.loads(http_get(url, {"X-NCP-APIGW-API-KEY-ID": cid,
+                                             "X-NCP-APIGW-API-KEY": secret}))
+            raw = data.get("items", [])
+            kept = 0
+            for it in raw:
+                orig = it.get("originallink") or ""
+                dom = outlet_of(orig)
+                if dom:
+                    kept += 1
+                    items.append(item(orig, clean(it.get("title")), orig or it.get("link"),
+                                      dom, parse_date(it.get("pubDate")), "네이버"))
+            log_source(name, True, kept, f"전체 {len(raw)}건 중 대상 언론사 {kept}건")
+        except Exception as e:
+            log_source(name, False, 0, str(e)[:120])
     return items
 
 
@@ -168,17 +189,22 @@ def fetch_google():
     q = urllib.parse.quote(f"({kws}) ({sites}) when:1d")
     url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
     items = []
-    for it in ET.fromstring(http_get(url)).iter("item"):
-        src = it.find("source")
-        dom = outlet_of(src.get("url") if src is not None else "")
-        if not dom:
-            continue
-        title = clean(it.findtext("title"))
-        name = clean(src.text) if src is not None else ""
-        if name and title.endswith(" - " + name):
-            title = title[: -len(name) - 3]
-        items.append(item(it.findtext("guid"), title, it.findtext("link"), dom,
-                          parse_date(it.findtext("pubDate"))))
+    try:
+        raw = list(ET.fromstring(http_get(url)).iter("item"))
+        for it in raw:
+            src = it.find("source")
+            dom = outlet_of(src.get("url") if src is not None else "")
+            if not dom:
+                continue
+            title = clean(it.findtext("title"))
+            name = clean(src.text) if src is not None else ""
+            if name and title.endswith(" - " + name):
+                title = title[: -len(name) - 3]
+            items.append(item(it.findtext("guid"), title, it.findtext("link"), dom,
+                              parse_date(it.findtext("pubDate")), "구글"))
+        log_source("구글 뉴스", True, len(items), f"전체 {len(raw)}건 중 대상 언론사 {len(items)}건")
+    except Exception as e:
+        log_source("구글 뉴스", False, 0, str(e)[:120])
     return items
 
 
@@ -194,25 +220,58 @@ def send_telegram(it):
     urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", body, timeout=20)
 
 
+def write_report(items, matched, new, sent, first_run, tg_errors):
+    stats = {d: {"fetched": 0, "matched": 0, "new": 0, "sent": 0, "via": set()} for d in OUTLETS}
+    for it in items:
+        stats[it["outlet"]]["fetched"] += 1
+        stats[it["outlet"]]["via"].add(it["via"])
+    for it in matched:
+        stats[it["outlet"]]["matched"] += 1
+    for it in new:
+        stats[it["outlet"]]["new"] += 1
+        if it.get("sent"):
+            stats[it["outlet"]]["sent"] += 1
+
+    lines = ["## 1. 요청 결과 (출처별)", "", "| 출처 | 결과 | 받은 기사 | 비고 |", "|---|---|---|---|"]
+    lines += [f"| {n} | {r} | {c} | {note} |" for n, r, c, note in SOURCE_LOG]
+    lines += ["", "## 2. 언론사별 결과", "",
+              "| 분류 | 언론사 | 수집 | 키워드 일치 | 신규 | 전송 | 경로 |",
+              "|---|---|---|---|---|---|---|"]
+    for d, s in sorted(stats.items(), key=lambda x: (OUTLETS[x[0]][1], OUTLETS[x[0]][0])):
+        name, cat = OUTLETS[d]
+        lines.append(f"| {cat} | {name} | {s['fetched']} | {s['matched']} | {s['new']} | "
+                     f"{s['sent']} | {', '.join(sorted(s['via'])) or '-'} |")
+    lines += ["", f"**합계** 수집 {len(items)} · 키워드 일치 {len(matched)} · 신규 {len(new)} · "
+                  f"전송 {sent} · 첫 실행 {'예(기록만)' if first_run else '아니오'}"]
+    if tg_errors:
+        lines += ["", "**텔레그램 전송 오류**", ""] + [f"- {e}" for e in tg_errors[:5]]
+    if new:
+        lines += ["", "## 3. 신규 기사", ""]
+        lines += [f"- [{OUTLETS[it['outlet']][0]}] {it['title']} ({it['via']})" for it in new[:50]]
+
+    report = "\n".join(lines)
+    print(report)
+    summary = os.getenv("GITHUB_STEP_SUMMARY")
+    if summary:  # Actions 실행 화면 Summary에 표로 표시
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write(report + "\n")
+
+
 def main():
     first_run = not os.path.exists(SEEN_FILE)
     seen = [] if first_run else json.load(open(SEEN_FILE, encoding="utf-8"))
     seen_set = set(seen)
 
-    items = []
-    for fetch in (fetch_direct, fetch_naver, fetch_google):  # 앞쪽 출처 우선
-        try:
-            items += fetch()
-        except Exception as e:
-            print(f"[warn] {fetch.__name__}: {e}", file=sys.stderr)
+    items = fetch_direct() + fetch_naver() + fetch_google()  # 앞쪽 출처 우선
 
     now = datetime.now(timezone.utc)
-    new = []
+    matched, new = [], []
     for it in items:
         if not it["link"] or not is_target(it["title"]):
             continue
         if it["date"] and now - it["date"] > MAX_AGE:
             continue
+        matched.append(it)
         keys = {it["id"], "t:" + norm_title(it["title"])}
         if keys & seen_set:
             continue
@@ -220,17 +279,18 @@ def main():
         seen += list(keys)
         new.append(it)
 
-    sent = 0
+    sent, tg_errors = 0, []
     if not first_run:  # 첫 실행은 기록만 (알림 폭탄 방지)
         for it in sorted(new, key=lambda x: x["date"] or now):
             try:
                 send_telegram(it)
+                it["sent"] = True
                 sent += 1
             except Exception as e:
-                print(f"[warn] telegram: {e}", file=sys.stderr)
+                tg_errors.append(str(e)[:200])
 
     json.dump(seen[-MAX_SEEN:], open(SEEN_FILE, "w", encoding="utf-8"), ensure_ascii=False)
-    print(f"fetched={len(items)} new={len(new)} sent={sent} first_run={first_run}")
+    write_report(items, matched, new, sent, first_run, tg_errors)
 
 
 if __name__ == "__main__":
