@@ -1,4 +1,4 @@
-# kepco-news-alert# 한전 뉴스 알림 (kepco-news-alert)
+# 한전 뉴스 알림 (kepco-news-alert)
 
 한국전력·한전 관련 기사와 개인정보·다크웹 기사를 지정한 언론사에서 찾아 텔레그램으로 알려주는 GitHub Actions 봇입니다.
 
@@ -65,6 +65,10 @@ README.md                           # 이 문서
 추가 설정:
 - Settings → Actions → General → Workflow permissions → **Read and write permissions** (`seen.json` 저장용)
 - 저장소는 **Public** 권장 (비공개는 무료 실행 시간 월 2,000분 초과)
+
+## 텔레그램 연결 테스트
+
+Actions → KEPCO news alert → **Run workflow**에서 **텔레그램 테스트 메시지 보내기**를 체크하고 실행하면, 알림방에 ✅ 테스트 메시지가 갑니다. 성공/실패 결과는 Summary 맨 위에 표시됩니다. 뉴스 확인은 평소대로 함께 실행됩니다.
 
 ## 실행 결과 확인
 
