@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -208,19 +209,30 @@ def fetch_google():
     return items
 
 
-def send_telegram(it):
+def send_text(text):
     token, chat = os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]
+    body = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML",
+                                   "disable_web_page_preview": "false"}).encode()
+    try:
+        urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", body, timeout=20)
+    except urllib.error.HTTPError as e:  # 텔레그램이 알려주는 실제 사유까지 남김
+        raise Exception(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}")
+
+
+def send_telegram(it):
     name, cat = OUTLETS[it["outlet"]]
     when = it["date"].astimezone(KST).strftime("%m/%d %H:%M") if it["date"] else ""
     icon = {"both": "🚨 한전+", "company": "⚡", "topic": "📎 참고"}[classify(it["title"])]
-    text = (f"{icon} [{cat}] {html.escape(name)}\n<b>{html.escape(it['title'])}</b>\n{when}\n"
-            f"<a href=\"{html.escape(it['link'])}\">기사 보기</a>")
-    body = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML",
-                                   "disable_web_page_preview": "false"}).encode()
-    urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", body, timeout=20)
+    send_text(f"{icon} [{cat}] {html.escape(name)}\n<b>{html.escape(it['title'])}</b>\n{when}\n"
+              f"<a href=\"{html.escape(it['link'])}\">기사 보기</a>")
 
 
-def write_report(items, matched, new, sent, first_run, tg_errors):
+def send_test_message():
+    now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+    send_text(f"✅ <b>테스트 메시지</b>\n한전 뉴스 알림 봇이 이 방에 정상 연결됐습니다.\n{now}")
+
+
+def write_report(items, matched, new, sent, first_run, tg_errors, test_result=None):
     stats = {d: {"fetched": 0, "matched": 0, "new": 0, "sent": 0, "via": set()} for d in OUTLETS}
     for it in items:
         stats[it["outlet"]]["fetched"] += 1
@@ -232,7 +244,10 @@ def write_report(items, matched, new, sent, first_run, tg_errors):
         if it.get("sent"):
             stats[it["outlet"]]["sent"] += 1
 
-    lines = ["## 1. 요청 결과 (출처별)", "", "| 출처 | 결과 | 받은 기사 | 비고 |", "|---|---|---|---|"]
+    lines = []
+    if test_result:
+        lines += ["## 테스트 메시지", "", f"**{test_result}**", ""]
+    lines += ["## 1. 요청 결과 (출처별)", "", "| 출처 | 결과 | 받은 기사 | 비고 |", "|---|---|---|---|"]
     lines += [f"| {n} | {r} | {c} | {note} |" for n, r, c, note in SOURCE_LOG]
     lines += ["", "## 2. 언론사별 결과", "",
               "| 분류 | 언론사 | 수집 | 키워드 일치 | 신규 | 전송 | 경로 |",
@@ -258,6 +273,14 @@ def write_report(items, matched, new, sent, first_run, tg_errors):
 
 
 def main():
+    test_result = None
+    if os.getenv("TEST_MESSAGE", "").lower() == "true":
+        try:
+            send_test_message()
+            test_result = "성공 (텔레그램 방을 확인하세요)"
+        except Exception as e:
+            test_result = f"실패: {str(e)[:200]}"
+
     first_run = not os.path.exists(SEEN_FILE)
     seen = [] if first_run else json.load(open(SEEN_FILE, encoding="utf-8"))
     seen_set = set(seen)
@@ -290,7 +313,7 @@ def main():
                 tg_errors.append(str(e)[:200])
 
     json.dump(seen[-MAX_SEEN:], open(SEEN_FILE, "w", encoding="utf-8"), ensure_ascii=False)
-    write_report(items, matched, new, sent, first_run, tg_errors)
+    write_report(items, matched, new, sent, first_run, tg_errors, test_result)
 
 
 if __name__ == "__main__":
