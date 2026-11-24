@@ -55,7 +55,7 @@ OUTLETS = {
 
 # 언론사 자체 RSS (전체기사 피드를 받아 키워드로 거름 → 네이버/구글보다 빠름)
 DIRECT_FEEDS = {
-    "boannews.com": "http://www.boannews.com/media/news_rss.xml",
+    "boannews.com": "https://www.boannews.com/rss/allArticle.xml",
     "dailysecu.com": "https://www.dailysecu.com/rss/allArticle.xml",
 }
 
@@ -185,27 +185,31 @@ def fetch_naver():
 
 
 def fetch_google():
-    sites = " OR ".join(f"site:{d}" for d in OUTLETS)
-    kws = " OR ".join(["한국전력", "한전", "KEPCO", *TOPIC_KEYWORDS])
-    q = urllib.parse.quote(f"({kws}) ({sites}) when:1d")
-    url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
+    # 키워드별로 따로 검색한 뒤 대상 언론사만 남김
+    # (언론사 site: 조건을 한 번에 묶으면 키워드가 무시된 결과가 섞여 나옴)
     items = []
-    try:
-        raw = list(ET.fromstring(http_get(url)).iter("item"))
-        for it in raw:
-            src = it.find("source")
-            dom = outlet_of(src.get("url") if src is not None else "")
-            if not dom:
-                continue
-            title = clean(it.findtext("title"))
-            name = clean(src.text) if src is not None else ""
-            if name and title.endswith(" - " + name):
-                title = title[: -len(name) - 3]
-            items.append(item(it.findtext("guid"), title, it.findtext("link"), dom,
-                              parse_date(it.findtext("pubDate")), "구글"))
-        log_source("구글 뉴스", True, len(items), f"전체 {len(raw)}건 중 대상 언론사 {len(items)}건")
-    except Exception as e:
-        log_source("구글 뉴스", False, 0, str(e)[:120])
+    for kw in ("한국전력", "한전", "KEPCO", *TOPIC_KEYWORDS):
+        name = f"구글 '{kw}'"
+        try:
+            q = urllib.parse.quote(f'"{kw}" when:1d')
+            url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
+            raw = list(ET.fromstring(http_get(url)).iter("item"))
+            kept = 0
+            for it in raw:
+                src = it.find("source")
+                dom = outlet_of(src.get("url") if src is not None else "")
+                if not dom:
+                    continue
+                title = clean(it.findtext("title"))
+                sname = clean(src.text) if src is not None else ""
+                if sname and title.endswith(" - " + sname):
+                    title = title[: -len(sname) - 3]
+                kept += 1
+                items.append(item(it.findtext("guid"), title, it.findtext("link"), dom,
+                                  parse_date(it.findtext("pubDate")), "구글"))
+            log_source(name, True, kept, f"전체 {len(raw)}건 중 대상 언론사 {kept}건")
+        except Exception as e:
+            log_source(name, False, 0, str(e)[:120])
     return items
 
 
@@ -285,7 +289,11 @@ def main():
     seen = [] if first_run else json.load(open(SEEN_FILE, encoding="utf-8"))
     seen_set = set(seen)
 
-    items = fetch_direct() + fetch_naver() + fetch_google()  # 앞쪽 출처 우선
+    items, ids = [], set()
+    for it in fetch_direct() + fetch_naver() + fetch_google():  # 앞쪽 출처 우선
+        if it["id"] not in ids:  # 여러 키워드 검색에 같은 기사가 겹치면 하나로
+            ids.add(it["id"])
+            items.append(it)
 
     now = datetime.now(timezone.utc)
     matched, new = [], []
