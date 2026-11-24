@@ -249,9 +249,36 @@ def send_telegram(it):
               f"<a href=\"{html.escape(it['link'])}\">기사 보기</a>")
 
 
+def tg_call(method, params=None):
+    """텔레그램 API 호출 결과를 (성공여부, 내용)으로 반환 (진단용)"""
+    token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(params).encode() if params else None
+    try:
+        with urllib.request.urlopen(url, data, timeout=15) as r:
+            return True, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}"
+    except Exception as e:
+        return False, str(e)[:200]
+
+
 def send_test_message():
+    """3단계 진단: ① 토큰(getMe) ② 방 확인(getChat) ③ 메시지 전송"""
+    chat = os.environ["TELEGRAM_CHAT_ID"].strip()
+    out = []
+    ok, r = tg_call("getMe")
+    out.append(f"① 토큰 확인: " + (f"성공 — 봇 @{r['result']['username']}" if ok else f"실패 — {r}"))
+    ok, r = tg_call("getChat", {"chat_id": chat})
+    out.append(f"② 알림방 확인: " + (f"성공 — '{r['result'].get('title', '')}' ({r['result']['type']})"
+                                  if ok else f"실패 — {r}"))
     now = datetime.now(KST).strftime("%Y-%m-%d %H:%M")
-    send_text(f"✅ <b>테스트 메시지</b>\n한전 뉴스 알림 봇이 이 방에 정상 연결됐습니다.\n{now}")
+    try:
+        send_text(f"✅ <b>테스트 메시지</b>\n한전 뉴스 알림 봇이 이 방에 정상 연결됐습니다.\n{now}")
+        out.append("③ 메시지 전송: 성공 (텔레그램 방을 확인하세요)")
+    except Exception as e:
+        out.append(f"③ 메시지 전송: 실패 — {str(e)[:200]}")
+    return out
 
 
 def write_report(items, matched, new, sent, first_run, tg_errors, test_result=None):
@@ -268,7 +295,7 @@ def write_report(items, matched, new, sent, first_run, tg_errors, test_result=No
 
     lines = []
     if test_result:
-        lines += ["## 테스트 메시지", "", f"**{test_result}**", ""]
+        lines += ["## 텔레그램 진단", ""] + [f"- {l}" for l in test_result] + [""]
     lines += ["## 1. 요청 결과 (출처별)", "", "| 출처 | 결과 | 받은 기사 | 비고 |", "|---|---|---|---|"]
     lines += [f"| {n} | {r} | {c} | {note} |" for n, r, c, note in SOURCE_LOG]
     lines += ["", "## 2. 언론사별 결과", "",
@@ -298,12 +325,10 @@ def main():
     progress("시작")
     test_result = None
     if os.getenv("TEST_MESSAGE", "").lower() == "true":
-        progress("테스트 메시지 전송 중")
-        try:
-            send_test_message()
-            test_result = "성공 (텔레그램 방을 확인하세요)"
-        except Exception as e:
-            test_result = f"실패: {str(e)[:200]}"
+        progress("텔레그램 진단 중")
+        test_result = send_test_message()
+        for line in test_result:
+            progress(line)
 
     first_run = not os.path.exists(SEEN_FILE)
     seen = [] if first_run else json.load(open(SEEN_FILE, encoding="utf-8"))
