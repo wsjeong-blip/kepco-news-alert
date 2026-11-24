@@ -340,6 +340,10 @@ def main():
                 time.sleep(1)  # 연속 전송 속도 제한
             except Exception as e:
                 tg_errors.append(str(e)[:200])
+                if "429" in str(e) or "연결 실패" in str(e):
+                    # 텔레그램이 막고 있으면 남은 기사는 이번엔 보내지 않고 다음 실행으로 넘김
+                    tg_errors.append("텔레그램 제한으로 이번 실행의 나머지 전송을 중단함")
+                    break
                 continue  # 실패한 기사는 기록하지 않음 → 다음 실행 때 다시 시도
         seen += list(it["keys"])
 
