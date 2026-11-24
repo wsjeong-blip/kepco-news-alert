@@ -11,6 +11,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -217,10 +218,27 @@ def send_text(text):
     token, chat = os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]
     body = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML",
                                    "disable_web_page_preview": "false"}).encode()
-    try:
-        urllib.request.urlopen(f"https://api.telegram.org/bot{token}/sendMessage", body, timeout=20)
-    except urllib.error.HTTPError as e:  # 텔레그램이 알려주는 실제 사유까지 남김
-        raise Exception(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    for attempt in range(2):  # 429(잠시 제한)·시간초과는 한 번 기다렸다 재시도
+        try:
+            urllib.request.urlopen(url, body, timeout=30)
+            return
+        except urllib.error.HTTPError as e:  # 텔레그램이 알려주는 실제 사유까지 남김
+            detail = e.read().decode("utf-8", "replace")[:200]
+            if e.code == 429 and attempt == 0:
+                try:
+                    wait = int(json.loads(detail)["parameters"]["retry_after"])
+                except Exception:
+                    wait = 30
+                if wait <= 60:
+                    time.sleep(wait + 1)
+                    continue
+            raise Exception(f"HTTP {e.code}: {detail}")
+        except (TimeoutError, urllib.error.URLError) as e:
+            if attempt == 0:
+                time.sleep(3)
+                continue
+            raise Exception(f"연결 실패: {e}")
 
 
 def send_telegram(it):
@@ -306,19 +324,22 @@ def main():
         keys = {it["id"], "t:" + norm_title(it["title"])}
         if keys & seen_set:
             continue
-        seen_set |= keys
-        seen += list(keys)
+        seen_set |= keys  # 이번 실행 안에서 중복 방지
+        it["keys"] = keys
         new.append(it)
 
     sent, tg_errors = 0, []
-    if not first_run:  # 첫 실행은 기록만 (알림 폭탄 방지)
-        for it in sorted(new, key=lambda x: x["date"] or now):
+    for it in sorted(new, key=lambda x: x["date"] or now):
+        if not first_run:  # 첫 실행은 기록만 (알림 폭탄 방지)
             try:
                 send_telegram(it)
                 it["sent"] = True
                 sent += 1
+                time.sleep(1)  # 연속 전송 속도 제한
             except Exception as e:
                 tg_errors.append(str(e)[:200])
+                continue  # 실패한 기사는 기록하지 않음 → 다음 실행 때 다시 시도
+        seen += list(it["keys"])
 
     json.dump(seen[-MAX_SEEN:], open(SEEN_FILE, "w", encoding="utf-8"), ensure_ascii=False)
     write_report(items, matched, new, sent, first_run, tg_errors, test_result)
