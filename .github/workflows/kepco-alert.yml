@@ -1,10 +1,8 @@
-
 name: KEPCO news alert
 
 on:
   schedule:
     - cron: "*/5 * * * *"
-
   workflow_dispatch:
     inputs:
       test_message:
@@ -22,8 +20,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -33,12 +30,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check news
+      - name: Check news and public threat intelligence
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          HIBP_API_KEY: ${{ secrets.HIBP_API_KEY }}
+          HIBP_DOMAIN: ${{ vars.HIBP_DOMAIN }}
           TEST_MESSAGE: ${{ inputs.test_message }}
         run: python kepco_alert.py
 
@@ -46,14 +45,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add seen.json
-
           if git diff --cached --quiet; then
             echo "No changes to seen.json"
             exit 0
           fi
-
-          git commit -m "update seen"
+          git commit -m "update seen [skip ci]"
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
