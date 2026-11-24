@@ -1,8 +1,10 @@
+
 name: KEPCO news alert
 
 on:
   schedule:
     - cron: "*/5 * * * *"
+
   workflow_dispatch:
     inputs:
       test_message:
@@ -21,11 +23,16 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
       - name: Check news
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -34,10 +41,19 @@ jobs:
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
           TEST_MESSAGE: ${{ inputs.test_message }}
         run: python kepco_alert.py
+
       - name: Save seen list
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
-          git pull --rebase
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add seen.json
-          git diff --cached --quiet || (git commit -m "update seen" && git push)
+
+          if git diff --cached --quiet; then
+            echo "No changes to seen.json"
+            exit 0
+          fi
+
+          git commit -m "update seen"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
