@@ -157,7 +157,8 @@ def fetch_direct():
 
 
 def fetch_naver():
-    cid, secret = os.getenv("NAVER_CLIENT_ID"), os.getenv("NAVER_CLIENT_SECRET")
+    cid = (os.getenv("NAVER_CLIENT_ID") or "").strip()
+    secret = (os.getenv("NAVER_CLIENT_SECRET") or "").strip()
     if not (cid and secret):
         SOURCE_LOG.append(("네이버 API", "건너뜀", 0, "키 미등록"))
         return []
@@ -215,7 +216,8 @@ def fetch_google():
 
 
 def send_text(text):
-    token, chat = os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]
+    token = os.environ["TELEGRAM_BOT_TOKEN"].strip()  # 붙여넣을 때 딸려온 줄바꿈·공백 제거
+    chat = os.environ["TELEGRAM_CHAT_ID"].strip()
     body = urllib.parse.urlencode({"chat_id": chat, "text": text, "parse_mode": "HTML",
                                    "disable_web_page_preview": "false"}).encode()
     url = f"https://api.telegram.org/bot{token}/sendMessage"
