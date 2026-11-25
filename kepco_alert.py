@@ -1,5 +1,6 @@
 """한국전력/한전 뉴스 알림 → 텔레그램
-- 대상: 지정 언론사(방송·통신·주요 일간지) + 보안 전문지
+- 제목에 A(한전 관련) + B(개인정보·유출·보안 관련) 단어가 함께 있을 때만 알림
+- 출처: 보안뉴스·데일리시큐 RSS, 네이버 뉴스, 구글 뉴스(모든 언론사), 랜섬웨어 유출 사이트
 - 한전 계열사 기사 제외
 
 환경변수
@@ -54,13 +55,9 @@ OUTLETS = {
     "datanet.co.kr": ("데이터넷", "보안"),
     # 다크웹 (랜섬웨어 조직 유출 사이트 모음)
     "ransomware.live": ("랜섬웨어 유출", "다크웹"),
-    # 감시 목록 밖 언론사 (한전 + 유출·해킹 기사만)
-    "_other": ("기타 언론", "유출보도"),
+    # 위 목록 밖 언론사 (네이버·구글에서 A+B 조합으로 잡힌 기사)
+    "_other": ("기타 언론", "기타"),
 }
-
-# 언론사 제한 없이 찾는 '한전 유출·해킹' 기사 (제목에 회사 + 사고 단어가 모두 있어야 알림)
-BREACH_QUERIES = ["한전 유출", "한국전력 유출", "한전 해킹", "한국전력 해킹", "KEPCO breach"]
-INCIDENT_RE = re.compile(r"유출|해킹|침해|랜섬|다크웹|털렸|breach|leak|hack", re.IGNORECASE)
 
 # 비슷한 제목(같은 사건)은 한 번만 알림: 글자쌍 유사도 기준 (0~1, 높을수록 엄격)
 SIMILAR_TITLE = 0.5
@@ -77,7 +74,7 @@ DIRECT_FEEDS = {
 # 랜섬웨어 유출 사이트 감시 (ransomware.live 공개 RSS, 다크웹 직접 접속 없음)
 RANSOMWARE_FEED = "https://www.ransomware.live/rss.xml"
 RANSOMWARE_WATCH = ["KEPCO", "Korea Electric Power", "kepco.co.kr", "한국전력", "한전"]
-RANSOMWARE_COUNTRY = "KR"   # 이 국가 피해 기관은 📎 참고로 알림 ("" 이면 끔)
+RANSOMWARE_COUNTRY = ""     # "KR"로 바꾸면 한전이 아니어도 국내 피해 기관을 참고 알림
 
 # ── 키워드 / 계열사 제외 ──
 AFFILIATES = [
@@ -86,11 +83,29 @@ AFFILIATES = [
     "한전기술", "한전원자력연료", "한전MCS", "한전엠씨에스",
     "한전산업개발", "한전ENS", "한전FMS", "한전CSC", "한전전력연구원",
 ]
-COMPANY_KEYWORDS = ["한국전력공사", "한국전력", "한전", "KEPCO"]  # 계열사 제외 적용
-TOPIC_KEYWORDS = ["개인정보", "다크웹"]                          # 참고용 (단독으로도 알림)
+# ── 알림 조건: 제목에 A와 B가 모두 있어야 함 ──
+# A: 한전 관련 (영문은 대소문자 구분 없음 → KEPCO, kepco, Kepco 모두 일치)
+A_KEYWORDS = ["한국전력공사", "한국전력", "한전", "KEPCO", "켑코", "Korea Electric Power",
+              "kepco.co.kr", "한전ON", "한전온", "SRM", "조달"]
+# B-강: 보안 사고 관련 → 🚨
+B_STRONG = ["개인정보", "개인 정보", "고객정보", "고객 정보", "주민번호", "주민등록번호", "계좌번호",
+            "다크웹", "darkweb", "dark web", "유출", "해킹", "해커", "침해", "랜섬웨어", "랜섬",
+            "탈취", "털렸", "털린", "사이버", "악성코드", "피싱", "스미싱", "도용", "노출",
+            "디도스", "DDoS", "크리덴셜", "보안사고", "보안 사고",
+            "breach", "leak", "hack", "ransomware", "phishing", "cyber"]
+# B-약: 범위가 넓은 단어 → ⚡ (전기요금 '피해', 요금 '정보' 같은 기사도 걸릴 수 있음)
+B_BROAD = ["정보", "피해", "보안", "공격"]
 
-COMPANY_RE = re.compile("|".join(map(re.escape, COMPANY_KEYWORDS)), re.IGNORECASE)
-TOPIC_RE = re.compile("|".join(map(re.escape, TOPIC_KEYWORDS)), re.IGNORECASE)
+# 검색어 (네이버·구글): A 단어로 검색 후 제목에서 A+B 조합만 남김
+SEARCH_A = ["한국전력", "한전", "KEPCO", "켑코", "SRM", "조달"]
+
+
+def _re(words):
+    return re.compile("|".join(sorted(map(re.escape, words), key=len, reverse=True)),
+                      re.IGNORECASE)
+
+
+A_RE, B_STRONG_RE, B_BROAD_RE = _re(A_KEYWORDS), _re(B_STRONG), _re(B_BROAD)
 AFFIL_RE = re.compile(
     "|".join(sorted(map(re.escape, AFFILIATES), key=len, reverse=True))
     + r"|KEPCO[\s\-]?(?:KPS|KDN|E&C|NF|ENS|MCS)",
@@ -98,12 +113,14 @@ AFFIL_RE = re.compile(
 
 
 def classify(title):
-    """'both' | 'company' | 'topic' | None"""
-    company = bool(COMPANY_RE.search(AFFIL_RE.sub(" ", title)))
-    topic = bool(TOPIC_RE.search(title))
-    if company and topic:
-        return "both"
-    return "company" if company else "topic" if topic else None
+    """'strong'(A+B강) | 'broad'(A+B약) | None"""
+    if not A_RE.search(AFFIL_RE.sub(" ", title)):  # 계열사 이름은 지우고 A 확인
+        return None
+    if B_STRONG_RE.search(title):
+        return "strong"
+    if B_BROAD_RE.search(title):
+        return "broad"
+    return None
 
 
 def is_target(title):
@@ -116,6 +133,30 @@ def outlet_of(url):
         if host == dom or host.endswith("." + dom):
             return dom
     return None
+
+
+# 감시 목록 밖 언론사 이름 표시용 (네이버는 언론사 이름을 주지 않아 도메인으로 추정)
+OTHER_NAMES = {
+    "mt.co.kr": "머니투데이", "edaily.co.kr": "이데일리", "asiae.co.kr": "아시아경제",
+    "etnews.com": "전자신문", "zdnet.co.kr": "지디넷코리아", "fnnews.com": "파이낸셜뉴스",
+    "heraldcorp.com": "헤럴드경제", "sedaily.com": "서울경제", "seoul.co.kr": "서울신문",
+    "kmib.co.kr": "국민일보", "segye.com": "세계일보", "munhwa.com": "문화일보",
+    "nocutnews.co.kr": "노컷뉴스", "ohmynews.com": "오마이뉴스", "newspim.com": "뉴스핌",
+    "dt.co.kr": "디지털타임스", "inews24.com": "아이뉴스24", "bloter.net": "블로터",
+    "electimes.com": "전기신문", "energy-news.co.kr": "에너지신문", "ekn.kr": "에너지경제",
+    "ddaily.co.kr": "디지털데일리", "byline.network": "바이라인네트워크",
+}
+
+
+def host_name(url):
+    h = (urllib.parse.urlparse(url or "").hostname or "").lower()
+    for dom, nm in OTHER_NAMES.items():
+        if h == dom or h.endswith("." + dom):
+            return nm
+    for pre in ("www.", "news.", "m.", "n."):
+        if h.startswith(pre):
+            h = h[len(pre):]
+    return h or "기타 언론"
 
 
 def clean(text):
@@ -194,9 +235,9 @@ def fetch_ransomware():
             desc = clean(it.findtext("description"))
             country = (it.findtext("category") or "").strip().upper()
             if watch_re.search(victim) or watch_re.search(desc):
-                kind = "both"            # 한전 관련 피해 → 🚨
+                kind = "strong"          # 한전 관련 피해 → 🚨
             elif RANSOMWARE_COUNTRY and country == RANSOMWARE_COUNTRY:
-                kind = "topic"           # 국내 피해 기관 → 📎 참고
+                kind = "broad"           # 국내 피해 기관 → ⚡ (RANSOMWARE_COUNTRY 설정 시)
             else:
                 continue
             items.append(item(it.findtext("guid") or it.findtext("link"),
@@ -211,89 +252,60 @@ def fetch_ransomware():
 
 
 def fetch_naver():
+    """네이버 뉴스 (NAVER API HUB). 모든 언론사 대상, A+B 조합은 main에서 판별"""
     cid = (os.getenv("NAVER_CLIENT_ID") or "").strip()
     secret = (os.getenv("NAVER_CLIENT_SECRET") or "").strip()
     if not (cid and secret):
         SOURCE_LOG.append(("네이버 API", "건너뜀", 0, "키 미등록"))
         return []
     items = []
-    for kw in ("한국전력", "한전", "KEPCO", *TOPIC_KEYWORDS):
+    for kw in SEARCH_A:
         name = f"네이버 '{kw}'"
         try:
-            # NAVER API HUB (2026.7.31부터 신규 키는 여기서만 발급)
             url = ("https://naverapihub.apigw.ntruss.com/search/v1/news"
                    "?display=100&sort=date&format=json&query=" + urllib.parse.quote(kw))
             data = json.loads(http_get(url, {"X-NCP-APIGW-API-KEY-ID": cid,
                                              "X-NCP-APIGW-API-KEY": secret}))
             raw = data.get("items", [])
-            kept = 0
+            combo = 0
             for it in raw:
-                orig = it.get("originallink") or ""
-                dom = outlet_of(orig)
-                if dom:
-                    kept += 1
-                    items.append(item(orig, clean(it.get("title")), orig or it.get("link"),
-                                      dom, parse_date(it.get("pubDate")), "네이버"))
-            log_source(name, True, kept, f"전체 {len(raw)}건 중 대상 언론사 {kept}건")
+                orig = it.get("originallink") or it.get("link") or ""
+                title = clean(it.get("title"))
+                dom = outlet_of(orig) or "_other"
+                sname = OUTLETS[dom][0] if dom != "_other" else host_name(orig)
+                combo += is_target(title)
+                items.append(item(orig, title, orig, dom, parse_date(it.get("pubDate")),
+                                  "네이버", None, sname))
+            log_source(name, True, len(raw), f"전체 {len(raw)}건 중 A+B 조합 {combo}건")
         except Exception as e:
             log_source(name, False, 0, str(e)[:120])
     return items
 
 
 def fetch_google():
-    # 키워드별로 따로 검색한 뒤 대상 언론사만 남김
-    # (언론사 site: 조건을 한 번에 묶으면 키워드가 무시된 결과가 섞여 나옴)
+    """구글 뉴스. A 단어 + B 단어(OR)로 검색, 모든 언론사 대상"""
+    b_or = " OR ".join(["개인정보", "유출", "해킹", "다크웹", "침해", "랜섬웨어", "사이버",
+                        "정보", "피해", "보안"])
     items = []
-    for kw in ("한국전력", "한전", "KEPCO", *TOPIC_KEYWORDS):
+    for kw in SEARCH_A:
         name = f"구글 '{kw}'"
         try:
-            q = urllib.parse.quote(f'"{kw}" when:1d')
+            q = urllib.parse.quote(f'"{kw}" ({b_or}) when:1d')
             url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
             raw = list(ET.fromstring(http_get(url)).iter("item"))
-            kept = 0
+            combo = 0
             for it in raw:
                 src = it.find("source")
-                dom = outlet_of(src.get("url") if src is not None else "")
-                if not dom:
-                    continue
+                dom = outlet_of(src.get("url") if src is not None else "") or "_other"
                 title = clean(it.findtext("title"))
                 sname = clean(src.text) if src is not None else ""
                 if sname and title.endswith(" - " + sname):
                     title = title[: -len(sname) - 3]
-                kept += 1
+                combo += is_target(title)
                 items.append(item(it.findtext("guid"), title, it.findtext("link"), dom,
-                                  parse_date(it.findtext("pubDate")), "구글"))
-            log_source(name, True, kept, f"전체 {len(raw)}건 중 대상 언론사 {kept}건")
-        except Exception as e:
-            log_source(name, False, 0, str(e)[:120])
-    return items
-
-
-def fetch_breach_news():
-    """감시 목록 밖 언론사까지: 제목에 한전 + 유출·해킹 단어가 함께 있는 기사"""
-    items = []
-    for kw in BREACH_QUERIES:
-        name = f"유출보도 '{kw}'"
-        try:
-            q = urllib.parse.quote(f"{kw} when:1d")
-            url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
-            raw = list(ET.fromstring(http_get(url)).iter("item"))
-            kept = 0
-            for it in raw:
-                src = it.find("source")
-                if outlet_of(src.get("url") if src is not None else ""):
-                    continue  # 감시 언론사는 기존 검색에서 처리
-                title = clean(it.findtext("title"))
-                sname = clean(src.text) if src is not None else ""
-                if sname and title.endswith(" - " + sname):
-                    title = title[: -len(sname) - 3]
-                if classify(title) not in ("company", "both") or not INCIDENT_RE.search(title):
-                    continue
-                kept += 1
-                items.append(item(it.findtext("guid"), title, it.findtext("link"), "_other",
-                                  parse_date(it.findtext("pubDate")), "구글", "both",
-                                  sname or "기타 언론"))
-            log_source(name, True, kept, f"전체 {len(raw)}건 중 한전+사고 제목 {kept}건")
+                                  parse_date(it.findtext("pubDate")), "구글", None,
+                                  sname or OUTLETS[dom][0]))
+            log_source(name, True, len(raw), f"전체 {len(raw)}건 중 A+B 조합 {combo}건")
         except Exception as e:
             log_source(name, False, 0, str(e)[:120])
     return items
@@ -341,7 +353,7 @@ def send_telegram(it):
     name = it.get("src_name") or name
     when = it["date"].astimezone(KST).strftime("%m/%d %H:%M") if it["date"] else ""
     kind = it.get("kind") or classify(it["title"])
-    icon = {"both": "🚨 한전+", "company": "⚡", "topic": "📎 참고"}[kind]
+    icon = {"strong": "🚨 한전+보안", "broad": "⚡ 한전+참고"}[kind]
     send_text(f"{icon} [{cat}] {html.escape(name)}\n<b>{html.escape(it['title'])}</b>\n{when}\n"
               f"<a href=\"{html.escape(it['link'])}\">기사 보기</a>")
 
@@ -390,7 +402,8 @@ def write_report(items, matched, new, sent, first_run, tg_errors, test_result=No
         if it.get("sent"):
             stats[it["outlet"]]["sent"] += 1
 
-    lines = []
+    lines = [f"**요약** 신규 {len(new)}건 · 전송 {sent}건 · "
+             f"{datetime.now(KST).strftime('%m/%d %H:%M')} 실행", ""]
     if test_result:
         lines += ["## 텔레그램 진단", ""] + [f"- {l}" for l in test_result] + [""]
     lines += ["## 1. 요청 결과 (출처별)", "", "| 출처 | 결과 | 받은 기사 | 비고 |", "|---|---|---|---|"]
@@ -406,9 +419,12 @@ def write_report(items, matched, new, sent, first_run, tg_errors, test_result=No
                   f"전송 {sent} · 첫 실행 {'예(기록만)' if first_run else '아니오'}"]
     if tg_errors:
         lines += ["", "**텔레그램 전송 오류**", ""] + [f"- {e}" for e in tg_errors[:5]]
+    lines += ["", "## 3. 신규 기사", ""]
+    if not new:
+        lines.append("이번 실행에서 새 기사 없음")
     if new:
-        lines += ["", "## 3. 신규 기사", ""]
-        lines += [f"- [{OUTLETS[it['outlet']][0]}] {it['title']} ({it['via']})" for it in new[:50]]
+        lines += [f"- [{it.get('src_name') or OUTLETS[it['outlet']][0]}] {it['title']} ({it['via']})"
+                  for it in new[:50]]
 
     report = "\n".join(lines)
     print(report)
@@ -432,8 +448,7 @@ def main():
     seen_set = set(seen)
 
     items, ids = [], set()
-    for it in fetch_direct() + fetch_ransomware() + fetch_naver() + fetch_google() \
-            + fetch_breach_news():  # 앞쪽 출처 우선
+    for it in fetch_direct() + fetch_ransomware() + fetch_naver() + fetch_google():  # 앞쪽 출처 우선
         if it["id"] not in ids:  # 여러 키워드 검색에 같은 기사가 겹치면 하나로
             ids.add(it["id"])
             items.append(it)
