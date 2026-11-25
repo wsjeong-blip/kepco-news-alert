@@ -20,19 +20,19 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 58
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Check news (자동 실행은 50분 동안 5분마다 반복)
+      - name: Check news (자동 실행은 5시간 30분 동안 5분마다 반복)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
-          LOOP_SECONDS: ${{ github.event_name == 'schedule' && 3000 || 0 }}
+          LOOP_SECONDS: ${{ github.event_name == 'schedule' && 19800 || 0 }}
           FIRST_TEST: ${{ inputs.test_message }}
         run: |
           git config user.name "github-actions"
