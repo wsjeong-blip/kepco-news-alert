@@ -20,33 +20,42 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 58
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Check news
+      - name: Check news (자동 실행은 50분 동안 5분마다 반복)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
-          TEST_MESSAGE: ${{ inputs.test_message }}
-        run: python kepco_alert.py
-      - name: Save seen list
+          LOOP_SECONDS: ${{ github.event_name == 'schedule' && 3000 || 0 }}
+          FIRST_TEST: ${{ inputs.test_message }}
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
-          git add seen.json
-          if git diff --cached --quiet; then
-            echo "변경 없음"
-            exit 0
-          fi
-          git commit -m "update seen"
-          for i in 1 2 3; do
-            git pull --rebase -X theirs && git push && exit 0
-            echo "저장 재시도 $i"
-            sleep 3
+
+          save_seen() {
+            git add seen.json
+            if git diff --cached --quiet; then return 0; fi
+            git commit -q -m "update seen"
+            for i in 1 2 3; do
+              git pull -q --rebase -X theirs && git push -q && return 0
+              echo "저장 재시도 $i"; sleep 3
+            done
+            echo "seen.json 저장 실패"
+          }
+
+          end=$(( $(date +%s) + LOOP_SECONDS ))
+          export TEST_MESSAGE="$FIRST_TEST"
+          while true; do
+            python kepco_alert.py || echo "이번 확인 실패, 다음 회차에 다시 시도"
+            save_seen
+            export TEST_MESSAGE=false
+            if [ $(( $(date +%s) + 300 )) -gt "$end" ]; then break; fi
+            echo "5분 대기..."
+            sleep 300
           done
-          exit 1
