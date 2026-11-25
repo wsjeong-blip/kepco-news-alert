@@ -55,6 +55,7 @@ OUTLETS = {
     "datanet.co.kr": ("데이터넷", "보안"),
     # 다크웹 (랜섬웨어 조직 유출 사이트 모음)
     "ransomware.live": ("랜섬웨어 유출", "다크웹"),
+    "darkwebinformer.com": ("Dark Web Informer", "다크웹"),
     # 위 목록 밖 언론사 (네이버·구글에서 A+B 조합으로 잡힌 기사)
     "_other": ("기타 언론", "기타"),
 }
@@ -74,6 +75,10 @@ DIRECT_FEEDS = {
 # 랜섬웨어 유출 사이트 감시 (ransomware.live 공개 RSS, 다크웹 직접 접속 없음)
 RANSOMWARE_FEED = "https://www.ransomware.live/rss.xml"
 RANSOMWARE_WATCH = ["KEPCO", "Korea Electric Power", "kepco.co.kr", "한국전력", "한전"]
+
+# 해킹 포럼 유출·판매 게시글 정리 블로그 (Dark Web Informer 공개 RSS, 다크웹 직접 접속 없음)
+# 제목·요약에 RANSOMWARE_WATCH 단어가 있으면 🚨 (게시글 자체가 유출 관련이라 B 단어 불필요)
+FORUM_FEED = "https://darkwebinformer.com/rss/"
 RANSOMWARE_COUNTRY = ""     # "KR"로 바꾸면 한전이 아니어도 국내 피해 기관을 참고 알림
 
 # ── 키워드 / 계열사 제외 ──
@@ -248,6 +253,29 @@ def fetch_ransomware():
                    f"전체 {len(raw)}건 중 감시 대상 {len(items)}건")
     except Exception as e:
         log_source("랜섬웨어 유출 사이트", False, 0, str(e)[:120])
+    return items
+
+
+def fetch_forum():
+    """해킹 포럼 유출·판매 게시글 (Dark Web Informer)에서 한전 관련 감지"""
+    watch_re = re.compile("|".join(map(re.escape, RANSOMWARE_WATCH)), re.IGNORECASE)
+    items = []
+    try:
+        raw = list(ET.fromstring(http_get(FORUM_FEED)).iter("item"))
+        for it in raw:
+            title = clean(it.findtext("title"))
+            desc = clean(it.findtext("description"))
+            text = AFFIL_RE.sub(" ", f"{title} {desc}")  # 계열사 이름은 제외
+            if not watch_re.search(text):
+                continue
+            link = (it.findtext("link") or "").strip()
+            items.append(item(it.findtext("guid") or link, f"[포럼 유출] {title}", link,
+                              "darkwebinformer.com", parse_date(it.findtext("pubDate")),
+                              "다크웹", "strong"))
+        log_source("포럼 유출 (Dark Web Informer)", True, len(items),
+                   f"전체 {len(raw)}건 중 한전 관련 {len(items)}건")
+    except Exception as e:
+        log_source("포럼 유출 (Dark Web Informer)", False, 0, str(e)[:120])
     return items
 
 
@@ -448,7 +476,7 @@ def main():
     seen_set = set(seen)
 
     items, ids = [], set()
-    for it in fetch_direct() + fetch_ransomware() + fetch_naver() + fetch_google():  # 앞쪽 출처 우선
+    for it in fetch_direct() + fetch_ransomware() + fetch_forum() + fetch_naver() + fetch_google():  # 앞쪽 출처 우선
         if it["id"] not in ids:  # 여러 키워드 검색에 같은 기사가 겹치면 하나로
             ids.add(it["id"])
             items.append(it)
